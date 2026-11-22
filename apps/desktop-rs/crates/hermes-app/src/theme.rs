@@ -86,4 +86,28 @@ impl HermesTheme {
             ThemeMode::Light => Self::nous_dark(),
         }
     }
+
+    /// Adopt a hex accent color from `runtime.describe`'s `SkinPayload`, if present.
+    pub fn apply_skin(&mut self, skin: &hermes_protocol::SkinPayload) {
+        let Some(colors) = skin.colors.as_ref() else {
+            return;
+        };
+        for key in ["banner_accent", "accent", "primary", "midground", "prompt"] {
+            if let Some(hex) = colors.get(key)
+                && let Some(parsed) = parse_hex_rgb(hex)
+            {
+                self.accent = rgb(parsed).into();
+                return;
+            }
+        }
+    }
+}
+
+fn parse_hex_rgb(raw: &str) -> Option<u32> {
+    let hex = raw.trim().strip_prefix('#')?;
+    if hex.len() == 6 {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        None
+    }
 }

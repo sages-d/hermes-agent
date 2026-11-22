@@ -2,6 +2,11 @@
 
 pub mod attach;
 pub mod client;
+pub mod reconnect;
 
 pub use attach::{AttachError, AttachOptions, GatewayDialTarget, GatewayEndpointInfo, attach_local_gateway};
-pub use client::{GatewayClient, GatewayError, GatewayHandshake, IncomingServerRequest};
+pub use client::{
+    BOT_CHAT_TITLE, GatewayClient, GatewayError, GatewayHandshake, IncomingServerRequest,
+    ReplayOutcome,
+};
+pub use reconnect::ReconnectPolicy;

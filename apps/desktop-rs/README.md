@@ -1,8 +1,8 @@
-# Hermes Native Companion (`apps/desktop-rs`) — GPUI Milestone 0
+# Hermes Native Companion (`apps/desktop-rs`) — GPUI Companion
 
 A native, memory-safe Rust desktop companion for Hermes Agent built on **GPUI** (Zed's GPU-accelerated UI framework) that attaches directly to the canonical `hermes-gateway-v1` gateway without bundling Chromium or Node.
 
-> **Status:** Milestone 0 prototype (macOS-first; compiles on macOS and Linux). Completely isolated from `apps/desktop/` (Electron) and core Python.
+> **Status:** Milestone 1 complete (macOS-first; compiles and passes tests on macOS and Linux). Completely isolated from `apps/desktop/` (Electron) and core Python.
 
 ---
 
@@ -11,17 +11,21 @@ A native, memory-safe Rust desktop companion for Hermes Agent built on **GPUI** 
 ```text
 apps/desktop-rs/
 ├── scripts/
-│   └── gen_protocol.py          # OpenRPC 1.3.2 -> Rust serde codegen
+│   └── gen_protocol.py          # OpenRPC 1.3.2 -> Rust serde codegen (`--check` supported)
 └── crates/
     ├── hermes-protocol/         # Generated wire types (311 schemas, 64 RPC methods,
     │                            #   16 server->client requests, 79 event notifications)
-    ├── hermes-gateway/          # `hermes gateway attach --json` + async WebSocket
+    ├── hermes-gateway/          # `hermes gateway attach --json`, async WebSocket
     │                            #   (`tokio-tungstenite`), ticket redaction, heartbeat,
-    │                            #   `runtime.describe`, `client.capabilities`, replay
+    │                            #   exponential reconnect backoff + bounded `--recover`,
+    │                            #   `session.events.since` replay / `session.resume` fallback,
+    │                            #   canonical Bot Chat resolver, profiles & subagents
     └── hermes-app/              # GPUI native UI (`hermes-companion` binary):
-                                 #   macOS transparent titlebar, Nous dark/light themes,
-                                 #   session sidebar, streaming Markdown, tool cards,
-                                 #   inline approval/clarify prompts, `/` slash palette
+                                 #   macOS transparent titlebar, Nous dark/light + skin accent,
+                                 #   full TextBuffer composer (cursor, selection, word jump,
+                                 #   clipboard, prompt history), syntect code highlighting + Copy,
+                                 #   session search, profile switcher, Bot Chat door, subagent
+                                 #   monitor bar, Cmd+K Command Palette, Cmd+Shift+K Quick Entry
 ```
 
 ### Wire Contract Single Source of Truth
@@ -30,6 +34,7 @@ Python (`tui_gateway/contracts/`) remains the sole schema authority. To refresh 
 
 ```bash
 python3 apps/desktop-rs/scripts/gen_protocol.py
+python3 apps/desktop-rs/scripts/gen_protocol.py --check
 ```
 
 ---
@@ -58,18 +63,24 @@ cargo build --release -p hermes-app
 ./target/release/hermes-companion
 ```
 
-> **Linux note:** `Cargo.lock` intentionally pins `libc` to `0.2.186` because `gpui 0.2.2` transitively pulls `xattr 0.2.3` (via `zed-async-tar`), which relies on `libc::ENOATTR` removed on Linux in `libc 0.2.190+`. Keep `--locked` on Linux or upgrade to a newer `gpui` release when moving past Milestone 0.
+> **Linux note:** `Cargo.lock` intentionally pins `libc` to `0.2.186` because `gpui 0.2.2` transitively pulls `xattr 0.2.3` (via `zed-async-tar`), which relies on `libc::ENOATTR` removed on Linux in `libc 0.2.190+`. Keep `--locked` on Linux or upgrade to a newer `gpui` release when moving past Milestone 1.
 
-### Keyboard Shortcuts (Milestone 0)
+### Keyboard Shortcuts
 
 | Shortcut | Action |
 |---|---|
 | `Enter` / `Shift+Enter` | Send prompt / insert newline |
+| `Left` / `Right` / `Alt+Left` / `Alt+Right` | Move cursor by character or word (add `Shift` to select) |
+| `Cmd+Left` / `Cmd+Right` | Jump to start / end of line |
+| `Cmd+A` / `Cmd+C` / `Cmd+X` / `Cmd+V` | Select all / Copy / Cut / Paste |
+| `↑` / `↓` (in single-line composer) | Cycle prompt history |
 | `/` (at start of input) | Open live slash command palette (`↑`/`↓` navigate, `Tab` complete) |
+| `Cmd+K` (`Ctrl+K`) | Open Command Palette (sessions, profiles, slash commands, actions) |
+| `Cmd+Shift+K` (`Ctrl+Shift+K`) | Open floating Quick Entry mini-composer window |
+| `Cmd+F` (`Ctrl+F`) | Focus sidebar session search |
 | `Cmd+N` (`Ctrl+N`) | Start a new session |
 | `Cmd+B` (`Ctrl+B`) | Toggle session sidebar |
-| `Cmd+V` (`Ctrl+V`) | Paste from clipboard |
-| `Esc` | Cancel active streaming turn or dismiss slash palette |
+| `Esc` | Close overlay / cancel active streaming turn |
 
 ---
 
@@ -80,15 +91,18 @@ cd apps/desktop-rs
 cargo test --workspace
 ```
 
-Covers:
-- `hermes-protocol`: JSON-RPC frame classification, typed `GatewayNotification` & `ServerRequestPayload` decoding, multipart transcript text extraction.
-- `hermes-gateway`: single-use ticket redaction in `Debug` output, full mock WebSocket `hermes-gateway-v1` handshake (`Sec-WebSocket-Protocol` ticket redemption, `client.capabilities`, `runtime.describe`, `session.list`, streaming `message.delta`, and `approval` server→client request round-trip).
-- `hermes-app`: headless `CompanionState` streaming delta reducer, slash palette filtering, and `pulldown-cmark` streaming Markdown parser (including unclosed code fences).
-
 ---
 
-## Roadmap Beyond Milestone 0
+## Roadmap
 
-- **Milestone 1 (Daily-driver Companion):** Full `EntityInputHandler` composer (IME, cursor selection, multi-line editing), auto-reconnect with `session.events.since` gap recovery, multi-profile switcher, Bot Mode canonical `"Bot Chat"` view, Quick Entry global hotkey window, and `syntect`/`tree-sitter` code highlighting.
-- **Milestone 2 (Power-user Parity):** `hermes-terminal` (`portable-pty` + `alacritty_terminal`), `hermes-git` (worktrees, diff review, stage/commit), file explorer, Settings/Cron/Capabilities views, macOS notifications + menu bar tray.
-- **Milestone 3 (Optional Web Boundary):** Lazy-loaded `wry` webview pane for interactive HTML artifacts and live preview only when opened (0 MB overhead when unused), plus Linux & Windows polish.
+- **Milestone 0 (Done):** OpenRPC → Rust codegen, ticketed `hermes-gateway-v1` WS client, minimal GPUI shell.
+- **Milestone 1 (Done):** Full `TextBuffer` composer, `syntect` syntax highlighting + Copy, auto-reconnect + `session.events.since` replay, multi-profile switcher, canonical `"Bot Chat"` resolver, subagent monitor bar, `Cmd+K` Command Palette, floating `QuickEntryView`, and skin accent adoption.
+- **Milestone 2 (Next — Power-User Parity):**
+  - `crates/hermes-terminal` (`portable-pty` + `alacritty_terminal`) embedded native terminal split pane
+  - `crates/hermes-git` (repo scan, worktrees, unified diff viewer, stage/unstage/commit)
+  - Workspace file explorer + code viewer
+  - Settings, Cron, Capabilities (Skills/MCP), and Usage/Billing native views
+  - macOS native notifications & menu bar tray
+- **Milestone 3 (Optional Web Boundary & Cross-OS):**
+  - Lazy-loaded `wry` webview pane for interactive HTML artifacts and live web preview only when opened (0 MB overhead when unused)
+  - Linux (Wayland/X11) & Windows packaging polish

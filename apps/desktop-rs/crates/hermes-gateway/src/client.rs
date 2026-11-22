@@ -16,16 +16,17 @@ use futures_util::{SinkExt, StreamExt};
 use hermes_protocol::methods;
 use hermes_protocol::{
     CANONICAL_GATEWAY_PROTOCOL, CanonicalCreateParams, CanonicalEventsParams, CanonicalEventsResult,
-    CanonicalListParams, CanonicalListResult, CanonicalResumeParams, CanonicalSnapshot,
-    CanonicalSubmitParams, CanonicalSubmitResult, ClientCapabilitiesParams, CommandsCatalogParams,
-    CommandsCatalogResult, CompleteSlashParams, CompleteSlashResult, GatewayEventEnvelope,
-    InboundFrame, JSON_RPC_METHOD_NOT_FOUND, JsonRpcErrorPayload, OutboundRequest,
-    OutboundResponse, PromptCancelParams, PromptResponseResult, RawInboundFrame, RequestId,
-    RpcMethod, RuntimeDescribeResult, ServerRequestPayload, SlashExecParams, SlashExecResult,
+    CanonicalListParams, CanonicalListResult, CanonicalProfilesParams, CanonicalProfilesResult,
+    CanonicalResumeParams, CanonicalSnapshot, CanonicalSubmitParams, CanonicalSubmitResult,
+    ClientCapabilitiesParams, CommandsCatalogParams, CommandsCatalogResult, CompleteSlashParams,
+    CompleteSlashResult, GatewayEventEnvelope, InboundFrame, JSON_RPC_METHOD_NOT_FOUND,
+    JsonRpcErrorPayload, OutboundRequest, OutboundResponse, PromptCancelParams,
+    PromptResponseResult, RawInboundFrame, RequestId, RpcMethod, RuntimeDescribeResult,
+    ServerRequestPayload, SessionParams, SlashExecParams, SlashExecResult, SubagentListResult,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
@@ -33,6 +34,22 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::attach::{AttachError, AttachOptions, GatewayDialTarget, attach_local_gateway};
+
+/// Canonical Bot Mode forever-chat title (`apps/desktop/src/AGENTS.md`).
+pub const BOT_CHAT_TITLE: &str = "Bot Chat";
+
+/// Result of attempting incremental catch-up after reconnect.
+#[derive(Debug)]
+pub enum ReplayOutcome {
+    /// Incremental events were sufficient to close the gap.
+    Events {
+        events: Vec<GatewayEventEnvelope>,
+        replay_epoch: Option<String>,
+        latest_seq: u64,
+    },
+    /// Replay ring truncated or epoch rotated; full snapshot was fetched via `session.resume`.
+    Snapshot(Box<CanonicalSnapshot>),
+}
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -152,6 +169,15 @@ struct GatewayClientInner {
     negotiated_subprotocol: Option<String>,
     runtime: std::sync::OnceLock<RuntimeDescribeResult>,
     alive: AtomicBool,
+    closed_notify: Notify,
+}
+
+impl GatewayClientInner {
+    fn mark_closed(&self) {
+        if self.alive.swap(false, Ordering::SeqCst) {
+            self.closed_notify.notify_waiters();
+        }
+    }
 }
 
 impl GatewayClient {
@@ -207,12 +233,13 @@ impl GatewayClient {
             negotiated_subprotocol,
             runtime: std::sync::OnceLock::new(),
             alive: AtomicBool::new(true),
+            closed_notify: Notify::new(),
         });
 
         let last_inbound = Arc::new(Mutex::new(Instant::now()));
 
         // Writer task
-        let writer_alive = Arc::clone(&inner);
+        let writer_inner = Arc::clone(&inner);
         tokio::spawn(async move {
             while let Some(text) = outbound_rx.recv().await {
                 if let Err(err) = ws_sink.send(Message::Text(text.into())).await {
@@ -220,7 +247,7 @@ impl GatewayClient {
                     break;
                 }
             }
-            writer_alive.alive.store(false, Ordering::SeqCst);
+            writer_inner.mark_closed();
             let _ = ws_sink.close().await;
         });
 
@@ -279,7 +306,6 @@ impl GatewayClient {
                                 answered: AtomicBool::new(false),
                             };
                             if server_req_tx.send(handle).await.is_err() {
-                                // Drop automatically responds with -32601 so backend never hangs.
                                 debug!("server request receiver closed");
                             }
                         }
@@ -291,7 +317,7 @@ impl GatewayClient {
                 }
             }
 
-            reader_inner.alive.store(false, Ordering::SeqCst);
+            reader_inner.mark_closed();
             let mut pending = reader_inner.pending.lock().await;
             for (_, tx) in pending.drain() {
                 let _ = tx.send(Err(JsonRpcErrorPayload {
@@ -349,7 +375,7 @@ impl GatewayClient {
                 interval.tick().await;
                 if hb_last_inbound.lock().await.elapsed() > HEARTBEAT_DEADLINE {
                     warn!("gateway heartbeat deadline exceeded; marking transport closed");
-                    hb_client.inner.alive.store(false, Ordering::SeqCst);
+                    hb_client.inner.mark_closed();
                     break;
                 }
                 let _ = hb_client
@@ -363,6 +389,18 @@ impl GatewayClient {
 
     pub fn is_connected(&self) -> bool {
         self.inner.alive.load(Ordering::SeqCst)
+    }
+
+    /// Resolves as soon as the WebSocket transport closes or trips its heartbeat deadline.
+    pub async fn wait_closed(&self) {
+        if !self.is_connected() {
+            return;
+        }
+        let notified = self.inner.closed_notify.notified();
+        if !self.is_connected() {
+            return;
+        }
+        notified.await;
     }
 
     pub fn handshake(&self) -> GatewayHandshake {
@@ -519,11 +557,143 @@ impl GatewayClient {
         &self,
         session_id: impl Into<String>,
         last_sequence: i64,
+        replay_epoch: Option<String>,
     ) -> Result<CanonicalEventsResult, GatewayError> {
         self.call::<methods::SessionEventsSince>(CanonicalEventsParams {
             session_id: session_id.into(),
             last_sequence: Some(last_sequence),
+            replay_epoch,
             ..Default::default()
+        })
+        .await
+    }
+
+    /// Reconcile a session after reconnect: try `session.events.since` first, and fall back
+    /// to a full `session.resume` snapshot whenever the ring truncated or the epoch rotated.
+    pub async fn replay_or_resume(
+        &self,
+        session_id: &str,
+        last_seq: u64,
+        replay_epoch: Option<String>,
+    ) -> Result<ReplayOutcome, GatewayError> {
+        if let Ok(res) = self
+            .events_since(session_id, last_seq as i64, replay_epoch)
+            .await
+            && !res.snapshot_required
+            && !res.truncated
+        {
+            let events = res
+                .events
+                .into_iter()
+                .map(|ev| GatewayEventEnvelope {
+                    event_type: ev.r#type,
+                    session_id: Some(ev.session_id),
+                    seq: Some(ev.seq.max(0) as u64),
+                    replay_epoch: Some(ev.replay_epoch),
+                    authority_epoch: ev.authority_epoch.map(|v| v.max(0) as u64),
+                    execution_generation: ev.execution_generation.map(|v| v.max(0) as u64),
+                    admission_id: ev.admission_id,
+                    profile: None,
+                    replayed: true,
+                    payload: ev.payload,
+                })
+                .collect();
+            return Ok(ReplayOutcome::Events {
+                events,
+                replay_epoch: Some(res.replay_epoch),
+                latest_seq: res.latest_seq.max(0) as u64,
+            });
+        }
+        let snap = self.resume_session(session_id).await?;
+        Ok(ReplayOutcome::Snapshot(Box::new(snap)))
+    }
+
+    /// Resolve the canonical Bot Mode forever-chat by NAME (`"Bot Chat"`), never by a stored pin.
+    ///
+    /// Follows `apps/desktop/src/AGENTS.md`:
+    /// 1. `session.list { title: "Bot Chat", include_hidden: true }` -> open if found.
+    /// 2. Otherwise create titled `"Bot Chat"`, born hidden, re-checking on conflict.
+    pub async fn open_or_create_bot_chat(&self) -> Result<CanonicalSnapshot, GatewayError> {
+        let found = self
+            .call::<methods::SessionList>(CanonicalListParams {
+                title: Some(BOT_CHAT_TITLE.to_string()),
+                include_hidden: Some(true),
+                limit: Some(5),
+                ..Default::default()
+            })
+            .await?;
+
+        if let Some(row) = found
+            .sessions
+            .into_iter()
+            .find(|s| s.title == BOT_CHAT_TITLE)
+        {
+            return self.resume_session(row.session_id).await;
+        }
+
+        // Adopt-before-minting: create hidden "Bot Chat"; on conflict re-query the registry.
+        let source = self
+            .inner
+            .runtime
+            .get()
+            .and_then(|rt| {
+                if rt.session_create.sources.iter().any(|s| s == "desktop") {
+                    Some("desktop".to_string())
+                } else {
+                    rt.session_create.sources.first().cloned()
+                }
+            })
+            .or_else(|| Some("desktop".to_string()));
+
+        match self
+            .call::<methods::SessionCreate>(CanonicalCreateParams {
+                request_id: Some(Uuid::new_v4().to_string()),
+                source,
+                title: Some(BOT_CHAT_TITLE.to_string()),
+                hidden: Some(true),
+                client: Some(hermes_protocol::CanonicalClientIdentity {
+                    name: "hermes-desktop-rs".to_string(),
+                    version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                }),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(snap) => Ok(snap),
+            Err(first_err) => {
+                let retry = self
+                    .call::<methods::SessionList>(CanonicalListParams {
+                        title: Some(BOT_CHAT_TITLE.to_string()),
+                        include_hidden: Some(true),
+                        limit: Some(5),
+                        ..Default::default()
+                    })
+                    .await?;
+                if let Some(row) = retry
+                    .sessions
+                    .into_iter()
+                    .find(|s| s.title == BOT_CHAT_TITLE)
+                {
+                    self.resume_session(row.session_id).await
+                } else {
+                    Err(first_err)
+                }
+            }
+        }
+    }
+
+    pub async fn list_profiles(&self) -> Result<CanonicalProfilesResult, GatewayError> {
+        self.call::<methods::ProfilesList>(CanonicalProfilesParams::default())
+            .await
+    }
+
+    pub async fn list_subagents(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<SubagentListResult, GatewayError> {
+        self.call::<methods::SubagentList>(SessionParams {
+            session_id: session_id.into(),
+            profile: None,
         })
         .await
     }
@@ -766,5 +936,142 @@ mod tests {
 
         let answer = approval_answer_rx.await.unwrap();
         assert_eq!(answer, json!({ "choice": "allow_once" }));
+    }
+
+    #[tokio::test]
+    async fn replay_and_bot_chat_canonical_resolution() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = accept_hdr_async(stream, |_req: &Request, mut resp: Response| {
+                resp.headers_mut()
+                    .insert(SEC_WEBSOCKET_PROTOCOL, CANONICAL_GATEWAY_PROTOCOL.parse().unwrap());
+                Ok(resp)
+            })
+            .await
+            .unwrap();
+            let (mut sink, mut source) = ws.split();
+
+            while let Some(Ok(Message::Text(text))) = source.next().await {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let id = frame["id"].clone();
+                let method = frame["method"].as_str().unwrap_or_default();
+                let params = &frame["params"];
+                let reply = match method {
+                    "client.capabilities" => json!({ "id": id, "result": { "server_requests": true } }),
+                    "runtime.describe" => json!({
+                        "id": id,
+                        "result": {
+                            "instance_id": "inst-2",
+                            "profile_id": "default",
+                            "authority_epoch": 2,
+                            "capabilities": ["session-authority-v1"],
+                            "session_create": { "sources": ["desktop"], "parameters": ["request_id", "source", "title", "hidden", "client"] }
+                        }
+                    }),
+                    "session.events.since" => {
+                        let last = params["last_sequence"].as_i64().unwrap_or(0);
+                        if last == 10 {
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "events": [{
+                                        "type": "message.delta",
+                                        "session_id": "s-1",
+                                        "payload": { "text": "caught-up" },
+                                        "replay_epoch": "ep-1",
+                                        "seq": 11
+                                    }],
+                                    "latest_seq": 11,
+                                    "last_sequence": 11,
+                                    "epoch": "ep-1",
+                                    "replay_epoch": "ep-1",
+                                    "truncated": false,
+                                    "snapshot_required": false,
+                                    "count": 1
+                                }
+                            })
+                        } else {
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "events": [],
+                                    "latest_seq": 50,
+                                    "last_sequence": 50,
+                                    "epoch": "ep-2",
+                                    "replay_epoch": "ep-2",
+                                    "truncated": true,
+                                    "snapshot_required": true,
+                                    "count": 0
+                                }
+                            })
+                        }
+                    }
+                    "session.list" if params["title"] == BOT_CHAT_TITLE && params["include_hidden"] == true => {
+                        json!({
+                            "id": id,
+                            "result": {
+                                "scope": "stored",
+                                "sessions": [{ "session_id": "bot-forever-1", "title": "Bot Chat" }]
+                            }
+                        })
+                    }
+                    "session.resume" => {
+                        let sid = params["session_id"].as_str().unwrap_or("s-1");
+                        json!({
+                            "id": id,
+                            "result": {
+                                "session_id": sid,
+                                "stored_session_id": sid,
+                                "messages": [],
+                                "message_count": 0,
+                                "running": false,
+                                "authority_epoch": 2,
+                                "replay_epoch": "ep-2",
+                                "last_sequence": 50,
+                                "subscription_id": "sub-1",
+                                "revision": 1,
+                                "execution_generation": 1,
+                                "pending": [],
+                                "prompts": [],
+                                "info": {}
+                            }
+                        })
+                    }
+                    _ => continue,
+                };
+                sink.send(Message::Text(reply.to_string().into())).await.unwrap();
+            }
+        });
+
+        let (client, _reqs) =
+            GatewayClient::connect(GatewayDialTarget::from_url(format!("ws://{addr}/api/ws")))
+                .await
+                .unwrap();
+
+        // Incremental replay returns replayed events without full snapshot
+        match client.replay_or_resume("s-1", 10, Some("ep-1".into())).await.unwrap() {
+            ReplayOutcome::Events { events, latest_seq, .. } => {
+                assert_eq!(latest_seq, 11);
+                assert_eq!(events.len(), 1);
+                assert!(events[0].replayed);
+            }
+            ReplayOutcome::Snapshot(_) => panic!("expected incremental events"),
+        }
+
+        // Truncated ring automatically falls back to full session.resume snapshot
+        match client.replay_or_resume("s-1", 1, Some("ep-0".into())).await.unwrap() {
+            ReplayOutcome::Snapshot(snap) => {
+                assert_eq!(snap.session_id, "s-1");
+                assert_eq!(snap.last_sequence, 50);
+            }
+            ReplayOutcome::Events { .. } => panic!("expected snapshot fallback"),
+        }
+
+        // Bot Mode resolves canonical "Bot Chat" by name with include_hidden=true
+        let bot = client.open_or_create_bot_chat().await.unwrap();
+        assert_eq!(bot.session_id, "bot-forever-1");
     }
 }

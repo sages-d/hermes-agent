@@ -7,19 +7,24 @@
 //!   hermes-companion --demo              # Launch offline interactive demo (no gateway needed)
 
 mod app_view;
+mod composer;
+mod highlight;
 mod markdown;
+mod quick_entry;
 mod state;
 mod theme;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use gpui::{
     App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px,
     size,
 };
 use hermes_gateway::{
-    AttachOptions, GatewayClient, GatewayDialTarget, IncomingServerRequest,
+    AttachOptions, GatewayClient, GatewayDialTarget, IncomingServerRequest, ReconnectPolicy,
+    ReplayOutcome,
 };
 use hermes_protocol::ServerRequestPayload;
 use serde_json::json;
@@ -59,7 +64,7 @@ impl CliConfig {
                 "--hermes-bin" => cfg.hermes_bin = args.next(),
                 "--help" | "-h" => {
                     println!(
-                        "hermes-companion (GPUI Milestone 0)\n\n\
+                        "hermes-companion (GPUI Milestone 1)\n\n\
                          Options:\n\
                            --demo                 Run offline interactive demo\n\
                            --url <ws://...>       Connect directly to a gateway WebSocket URL\n\
@@ -74,6 +79,13 @@ impl CliConfig {
         }
         cfg
     }
+}
+
+#[derive(Debug, Default, Clone)]
+struct ReplayCursor {
+    session_id: Option<String>,
+    last_seq: u64,
+    replay_epoch: Option<String>,
 }
 
 fn spawn_gateway_worker(
@@ -98,6 +110,8 @@ fn spawn_gateway_worker(
 
 async fn connect_once(
     cfg: &CliConfig,
+    start: bool,
+    recover: bool,
 ) -> Result<(GatewayClient, mpsc::Receiver<IncomingServerRequest>), hermes_gateway::GatewayError> {
     if let Some(url) = &cfg.url {
         GatewayClient::connect(GatewayDialTarget::from_url(url.clone())).await
@@ -105,6 +119,8 @@ async fn connect_once(
         let mut opts = AttachOptions::default();
         opts.profile = cfg.profile.clone();
         opts.hermes_home = cfg.hermes_home.clone();
+        opts.start = start;
+        opts.recover = recover;
         if let Some(bin) = &cfg.hermes_bin {
             opts.hermes_bin = bin.clone();
         }
@@ -113,19 +129,24 @@ async fn connect_once(
 }
 
 async fn run_gateway_loop(
-    cfg: CliConfig,
+    mut cfg: CliConfig,
     cmd_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
     ui_tx: &mpsc::UnboundedSender<WorkerEvent>,
 ) {
     let mut client: Option<GatewayClient> = None;
+    let mut reconnect_policy = ReconnectPolicy::default();
+    let mut cursor = ReplayCursor::default();
     let mut pending_server_reqs: HashMap<String, IncomingServerRequest> = HashMap::new();
     let (internal_req_tx, mut internal_req_rx) = mpsc::unbounded_channel::<IncomingServerRequest>();
+    let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel::<()>();
 
-    // Initial connection attempt
+    // Initial connection attempt (`--start` enabled on first launch)
     let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Connecting));
-    match connect_once(&cfg).await {
+    match connect_once(&cfg, true, false).await {
         Ok((c, server_rx)) => {
-            hydrate_after_connect(&c, server_rx, ui_tx, &internal_req_tx).await;
+            reconnect_policy.reset_backoff();
+            attach_disconnect_watcher(&c, &reconnect_tx);
+            hydrate_after_connect(&c, server_rx, ui_tx, &internal_req_tx, None).await;
             client = Some(c);
         }
         Err(err) => {
@@ -144,6 +165,38 @@ async fn run_gateway_loop(
 
     loop {
         tokio::select! {
+            Some(()) = reconnect_rx.recv() => {
+                // Only auto-reconnect if we previously had a live client that dropped.
+                if client.as_ref().is_some_and(GatewayClient::is_connected) {
+                    continue;
+                }
+                client = None;
+                let delay = reconnect_policy.next_delay();
+                let attempt = reconnect_policy.attempts();
+                let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Reconnecting {
+                    attempt,
+                    delay_secs: delay.as_secs(),
+                }));
+                tokio::time::sleep(delay).await;
+
+                let recover = reconnect_policy.allow_owner_recovery(Instant::now());
+                match connect_once(&cfg, false, recover).await {
+                    Ok((c, server_rx)) => {
+                        reconnect_policy.reset_backoff();
+                        attach_disconnect_watcher(&c, &reconnect_tx);
+                        hydrate_after_connect(&c, server_rx, ui_tx, &internal_req_tx, Some(&cursor)).await;
+                        client = Some(c);
+                    }
+                    Err(err) => {
+                        warn!(attempt, error = %err, "auto-reconnect attempt failed");
+                        let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Disconnected(
+                            err.to_string(),
+                        )));
+                        // Schedule next backoff retry automatically
+                        let _ = reconnect_tx.send(());
+                    }
+                }
+            }
             Some(req) = internal_req_rx.recv() => {
                 let req_id = req.id.to_string();
                 let maybe_prompt = match &req.payload {
@@ -178,7 +231,9 @@ async fn run_gateway_loop(
                             id: req_id.clone(),
                             session_id: Some(c.session_id.clone()),
                             kind: PendingPromptKind::Clarify {
-                                question: first.map(|q| q.question.clone()).unwrap_or_else(|| "Clarification requested".into()),
+                                question: first
+                                    .map(|q| q.question.clone())
+                                    .unwrap_or_else(|| "Clarification requested".into()),
                                 choices: first.and_then(|q| q.choices.clone()).unwrap_or_default(),
                             },
                         })
@@ -192,15 +247,44 @@ async fn run_gateway_loop(
             }
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
+                    UiCommand::SyncReplayCursor { session_id, last_seq, replay_epoch } => {
+                        cursor.session_id = session_id;
+                        cursor.last_seq = last_seq;
+                        cursor.replay_epoch = replay_epoch;
+                    }
                     UiCommand::Reconnect => {
+                        reconnect_policy.reset_backoff();
                         let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Connecting));
-                        match connect_once(&cfg).await {
+                        match connect_once(&cfg, true, true).await {
                             Ok((c, server_rx)) => {
-                                hydrate_after_connect(&c, server_rx, ui_tx, &internal_req_tx).await;
+                                attach_disconnect_watcher(&c, &reconnect_tx);
+                                hydrate_after_connect(&c, server_rx, ui_tx, &internal_req_tx, Some(&cursor)).await;
                                 client = Some(c);
                             }
                             Err(err) => {
                                 let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Disconnected(err.to_string())));
+                            }
+                        }
+                    }
+                    UiCommand::SwitchProfile(next_profile) => {
+                        cfg.profile = Some(next_profile);
+                        client = None;
+                        cursor = ReplayCursor::default();
+                        pending_server_reqs.clear();
+                        reconnect_policy.reset_backoff();
+                        let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Connecting));
+                        match connect_once(&cfg, true, false).await {
+                            Ok((c, server_rx)) => {
+                                attach_disconnect_watcher(&c, &reconnect_tx);
+                                hydrate_after_connect(&c, server_rx, ui_tx, &internal_req_tx, None).await;
+                                client = Some(c);
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Disconnected(err.to_string())));
+                                let _ = ui_tx.send(WorkerEvent::Notice {
+                                    text: format!("Profile switch failed: {err}"),
+                                    is_error: true,
+                                });
                             }
                         }
                     }
@@ -222,11 +306,29 @@ async fn run_gateway_loop(
                             }
                         }
                     }
-                    UiCommand::SelectSession(sid) => {
+                    UiCommand::OpenBotChat => {
                         if let Some(c) = &client {
-                            match c.resume_session(sid).await {
+                            match c.open_or_create_bot_chat().await {
                                 Ok(snap) => {
                                     let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+                                }
+                                Err(err) => {
+                                    let _ = ui_tx.send(WorkerEvent::Notice {
+                                        text: format!("Failed to open Bot Chat: {err}"),
+                                        is_error: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    UiCommand::SelectSession(sid) => {
+                        if let Some(c) = &client {
+                            match c.resume_session(sid.clone()).await {
+                                Ok(snap) => {
+                                    let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+                                    if let Ok(subs) = c.list_subagents(sid).await {
+                                        let _ = ui_tx.send(WorkerEvent::Subagents(subs));
+                                    }
                                 }
                                 Err(err) => {
                                     let _ = ui_tx.send(WorkerEvent::Notice {
@@ -309,13 +411,30 @@ async fn run_gateway_loop(
     }
 }
 
+fn attach_disconnect_watcher(
+    client: &GatewayClient,
+    reconnect_tx: &mpsc::UnboundedSender<()>,
+) {
+    let watched = client.clone();
+    let tx = reconnect_tx.clone();
+    tokio::spawn(async move {
+        watched.wait_closed().await;
+        let _ = tx.send(());
+    });
+}
+
 async fn hydrate_after_connect(
     client: &GatewayClient,
     mut server_rx: mpsc::Receiver<IncomingServerRequest>,
     ui_tx: &mpsc::UnboundedSender<WorkerEvent>,
     internal_req_tx: &mpsc::UnboundedSender<IncomingServerRequest>,
+    replay_cursor: Option<&ReplayCursor>,
 ) {
     let hs = client.handshake();
+    if let Some(skin) = hs.runtime.as_ref().and_then(|r| r.skin.clone()) {
+        let _ = ui_tx.send(WorkerEvent::Skin(skin));
+    }
+
     let profile = hs
         .runtime
         .as_ref()
@@ -367,14 +486,42 @@ async fn hydrate_after_connect(
         }
     });
 
-    // Hydrate session list & slash command catalog.
+    // Hydrate profile list.
+    if let Ok(profiles) = client.list_profiles().await {
+        let _ = ui_tx.send(WorkerEvent::Profiles(profiles));
+    }
+
+    // Hydrate session list and either replay active session or resume most recent session.
     if let Ok(list) = client.list_sessions(Some(50), false).await {
         let first_id = list.sessions.first().map(|s| s.session_id.clone());
         let _ = ui_tx.send(WorkerEvent::SessionList(list));
-        if let Some(sid) = first_id
-            && let Ok(snap) = client.resume_session(sid).await
+
+        if let Some(cur) = replay_cursor
+            && let Some(sid) = cur.session_id.as_deref()
+        {
+            match client
+                .replay_or_resume(sid, cur.last_seq, cur.replay_epoch.clone())
+                .await
+            {
+                Ok(ReplayOutcome::Events { events, .. }) => {
+                    for ev in events {
+                        let _ = ui_tx.send(WorkerEvent::GatewayEvent(ev));
+                    }
+                }
+                Ok(ReplayOutcome::Snapshot(snap)) => {
+                    let _ = ui_tx.send(WorkerEvent::Snapshot(*snap));
+                }
+                Err(err) => {
+                    warn!(error = %err, "reconnect catchup failed");
+                }
+            }
+        } else if let Some(sid) = first_id
+            && let Ok(snap) = client.resume_session(sid.clone()).await
         {
             let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+            if let Ok(subs) = client.list_subagents(sid).await {
+                let _ = ui_tx.send(WorkerEvent::Subagents(subs));
+            }
         }
     }
 
@@ -390,7 +537,9 @@ async fn hydrate_after_connect(
                         let hidden = meta
                             .get(name)
                             .and_then(|m| m.desktop.as_deref())
-                            .is_some_and(|d| matches!(d, "hidden" | "terminal-only" | "messaging-only"));
+                            .is_some_and(|d| {
+                                matches!(d, "hidden" | "terminal-only" | "messaging-only")
+                            });
                         if !hidden && seen.insert(name.clone()) {
                             items.push(SlashCommandItem {
                                 name: name.clone(),
@@ -459,7 +608,7 @@ fn main() {
     };
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1120.0), px(760.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1160.0), px(780.0)), cx);
         let mut initial_state = Some(initial_state);
         let mut ui_rx = Some(ui_rx);
         let cmd_tx = cmd_tx.clone();

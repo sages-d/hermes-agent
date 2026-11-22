@@ -6,11 +6,12 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, StyledText, div, prelude::*,
-    px,
+    AnyElement, ClipboardItem, FontStyle, FontWeight, HighlightStyle, IntoElement, SharedString,
+    StyledText, div, prelude::*, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+use crate::highlight::highlighted_code;
 use crate::theme::HermesTheme;
 
 #[derive(Debug, Clone)]
@@ -272,7 +273,7 @@ pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
     }
 
     let mut container = div().flex().flex_col().gap_2().w_full();
-    for block in blocks {
+    for (block_idx, block) in blocks.into_iter().enumerate() {
         let elem: AnyElement = match block {
             Block::Heading { level, content } => {
                 let mut d = div()
@@ -321,8 +322,13 @@ pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
                 let label = if lang.is_empty() {
                     "code".to_string()
                 } else {
-                    lang
+                    lang.clone()
                 };
+                let copy_text = code.clone();
+                let highlighted = highlighted_code(&code, &lang, theme.mode);
+                let copy_id = SharedString::from(format!("copy-code-{block_idx}-{}", code.len()));
+                let hover_bg = theme.surface_hover;
+                let fg_color = theme.fg;
                 div()
                     .flex()
                     .flex_col()
@@ -343,7 +349,22 @@ pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
                             .border_color(theme.border)
                             .text_xs()
                             .text_color(theme.fg_muted)
-                            .child(label),
+                            .child(label)
+                            .child(
+                                div()
+                                    .id(copy_id)
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(hover_bg).text_color(fg_color))
+                                    .child("Copy")
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_text.clone(),
+                                        ));
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -353,7 +374,7 @@ pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
                             .line_height(px(18.0))
                             .font_family("Menlo")
                             .text_color(theme.fg)
-                            .child(code),
+                            .child(highlighted),
                     )
                     .into_any_element()
             }

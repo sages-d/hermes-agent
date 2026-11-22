@@ -1,17 +1,21 @@
-//! UI-agnostic state & event reducer for the Hermes companion app.
+//! UI-agnostic state & event reducer for the Hermes companion app (Milestone 1).
 //!
-//! Kept free of GPUI types so all transcript accumulation, streaming delta handling,
-//! Bot Mode canonical chat labeling, approval prompts, and slash palette filtering
-//! are unit-testable headlessly.
+//! Kept free of GPUI types so transcript accumulation, streaming delta handling,
+//! replay epoch tracking, Bot Mode labeling, subagents, session filtering,
+//! and Command Palette search are unit-testable headlessly.
 
 use hermes_protocol::{
-    CanonicalListResult, CanonicalSnapshot, GatewayEventEnvelope, GatewayNotification,
-    transcript_content_text,
+    CanonicalListResult, CanonicalProfilesResult, CanonicalSnapshot, GatewayEventEnvelope,
+    GatewayNotification, SubagentListResult, SubagentStatus, transcript_content_text,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
     Connecting,
+    Reconnecting {
+        attempt: u32,
+        delay_secs: u64,
+    },
     Connected {
         profile: String,
         instance_id: String,
@@ -25,6 +29,10 @@ impl ConnectionStatus {
     pub fn label(&self) -> String {
         match self {
             Self::Connecting => "Connecting...".to_string(),
+            Self::Reconnecting {
+                attempt,
+                delay_secs,
+            } => format!("Reconnecting (#{attempt}, {delay_secs}s)..."),
             Self::Connected { profile, .. } => format!("Connected ({profile})"),
             Self::Demo => "Demo Mode (offline)".to_string(),
             Self::Disconnected(reason) => format!("Disconnected: {reason}"),
@@ -37,12 +45,28 @@ impl ConnectionStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileInfo {
+    pub name: String,
+    pub display_name: String,
+    pub model: Option<String>,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     pub session_id: String,
     pub title: String,
     pub is_bot_chat: bool,
     pub running: bool,
     pub preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentSummary {
+    pub id: String,
+    pub goal: String,
+    pub running: bool,
+    pub status_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,8 +113,6 @@ pub enum PendingPromptKind {
 
 #[derive(Debug, Clone)]
 pub struct PendingPrompt {
-    /// Correlation key: either a server->client JSON-RPC request id (`srq-...`)
-    /// or a canonical `prompt_id`.
     pub id: String,
     pub session_id: Option<String>,
     pub kind: PendingPromptKind,
@@ -103,16 +125,43 @@ pub struct SlashCommandItem {
     pub category: String,
 }
 
-/// Complete Milestone 0 companion workspace state.
+/// Actions selectable from the `Cmd+K` Command Palette.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteAction {
+    NewChat,
+    OpenBotChat,
+    OpenQuickEntry,
+    ToggleTheme,
+    ToggleSidebar,
+    ToggleReasoning,
+    SelectSession(String),
+    SwitchProfile(String),
+    InsertSlash(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteItem {
+    pub title: String,
+    pub subtitle: String,
+    pub badge: String,
+    pub action: PaletteAction,
+}
+
+/// Complete Milestone 1 companion workspace state.
 #[derive(Debug, Clone)]
 pub struct CompanionState {
     pub status: ConnectionStatus,
     pub sidebar_open: bool,
+    pub profiles: Vec<ProfileInfo>,
+    pub active_profile: String,
+    pub profile_menu_open: bool,
     pub sessions: Vec<SessionSummary>,
     pub active_session_id: Option<String>,
     pub active_title: String,
     pub last_seq: u64,
+    pub replay_epoch: Option<String>,
     pub messages: Vec<ChatItem>,
+    pub subagents: Vec<SubagentSummary>,
     pub is_streaming: bool,
     pub pending_prompts: Vec<PendingPrompt>,
     pub slash_catalog: Vec<SlashCommandItem>,
@@ -125,11 +174,21 @@ impl Default for CompanionState {
         Self {
             status: ConnectionStatus::Connecting,
             sidebar_open: true,
+            profiles: vec![ProfileInfo {
+                name: "default".into(),
+                display_name: "default".into(),
+                model: None,
+                is_default: true,
+            }],
+            active_profile: "default".into(),
+            profile_menu_open: false,
             sessions: Vec::new(),
             active_session_id: None,
             active_title: "New Chat".to_string(),
             last_seq: 0,
+            replay_epoch: None,
             messages: Vec::new(),
+            subagents: Vec::new(),
             is_streaming: false,
             pending_prompts: Vec::new(),
             slash_catalog: default_slash_catalog(),
@@ -141,24 +200,44 @@ impl Default for CompanionState {
 
 impl CompanionState {
     /// Populate an interactive offline demo workspace (`--demo`) showcasing
-    /// streaming Markdown, tool calls, slash palette, and approval cards.
+    /// Milestone 1 features (syntax highlighting, profiles, Bot Chat, subagents, approvals).
     pub fn demo() -> Self {
         let mut state = Self::default();
         state.status = ConnectionStatus::Demo;
+        state.profiles = vec![
+            ProfileInfo {
+                name: "default".into(),
+                display_name: "default".into(),
+                model: Some("claude-sonnet-4".into()),
+                is_default: true,
+            },
+            ProfileInfo {
+                name: "work".into(),
+                display_name: "work".into(),
+                model: Some("gpt-5".into()),
+                is_default: false,
+            },
+            ProfileInfo {
+                name: "research".into(),
+                display_name: "research".into(),
+                model: Some("hermes-4".into()),
+                is_default: false,
+            },
+        ];
         state.sessions = vec![
             SessionSummary {
                 session_id: "demo-1".to_string(),
-                title: "GPUI Companion Milestone 0".to_string(),
+                title: "GPUI Companion Milestone 1".to_string(),
                 is_bot_chat: false,
                 running: false,
-                preview: "Native Rust shell connected to hermes-gateway-v1".to_string(),
+                preview: "Syntax highlighting, Cmd+K palette, Quick Entry, auto-reconnect".to_string(),
             },
             SessionSummary {
                 session_id: "demo-bot".to_string(),
                 title: "Bot Chat".to_string(),
                 is_bot_chat: true,
                 running: false,
-                preview: "Canonical forever-chat for default profile".to_string(),
+                preview: "Canonical forever-chat resolved by name".to_string(),
             },
             SessionSummary {
                 session_id: "demo-2".to_string(),
@@ -169,29 +248,38 @@ impl CompanionState {
             },
         ];
         state.active_session_id = Some("demo-1".to_string());
-        state.active_title = "GPUI Companion Milestone 0".to_string();
+        state.active_title = "GPUI Companion Milestone 1".to_string();
+        state.subagents = vec![SubagentSummary {
+            id: "sub-1".into(),
+            goal: "Verify OpenRPC schema parity".into(),
+            running: false,
+            status_label: "completed".into(),
+        }];
         state.messages = vec![
             ChatItem::User {
-                text: "Summarize how this Rust GPUI companion talks to the Hermes gateway.".to_string(),
+                text: "What's new in Milestone 1 of the Rust GPUI companion?".to_string(),
             },
             ChatItem::ToolCall {
                 name: "read_file".to_string(),
-                summary: "tui_gateway/AGENTS.md (lines 1-95)".to_string(),
+                summary: "apps/desktop-rs/crates/hermes-gateway/src/reconnect.rs".to_string(),
                 status: ToolStatus::Completed,
-                output: Some("Loaded canonical OpenRPC contract (54 canonical methods, 79 events).".to_string()),
+                output: Some("Loaded exponential backoff (1s..30s) + session.events.since catch-up.".to_string()),
             },
             ChatItem::Assistant {
-                reasoning: "Inspecting the attach contract and OpenRPC schema before summarizing.".to_string(),
-                text: "### Native GPUI Companion (`hermes-companion`)\n\n\
-                       This companion attaches directly to the canonical Hermes gateway without spawning or owning Python:\n\n\
-                       - **Local attach:** invokes `hermes gateway attach --json` and redeems the single-use ticket via `Sec-WebSocket-Protocol: hermes-gateway-v1, hermes-gateway-ticket.<t>`.\n\
-                       - **Typed wire protocol:** `hermes-protocol` is generated straight from `apps/shared/src/gateway-contract.openrpc.json`.\n\
-                       - **Interactive controls:** advertises `client.capabilities { server_requests: true }` so `approval` and `clarify` cards appear inline.\n\n\
+                reasoning: "Summarizing Milestone 1 daily-driver upgrades across gateway, editor, and GPUI.".to_string(),
+                text: "### Milestone 1 — Daily-Driver Native Companion\n\n\
+                       - **Full Composer Editing:** cursor movement, Shift-selection, `Alt+Left/Right` word jump, `Cmd+A/C/X/V`, and `↑`/`↓` prompt history.\n\
+                       - **Pure-Rust Syntax Highlighting:** fenced blocks highlight via `syntect` (`default-fancy`) with one-click **Copy**.\n\
+                       - **Auto-Reconnect & Replay:** exponential backoff (`1s → 30s`) with `session.events.since` gap replay and automatic `session.resume` fallback.\n\
+                       - **Multi-Profile + Canonical Bot Chat:** switch profiles from the sidebar footer or click **Bot Chat** (always resolved by name).\n\
+                       - **`Cmd+K` Command Palette & `Cmd+Shift+K` Quick Entry:** jump to any session, profile, slash command, or floating mini-composer.\n\n\
                        ```rust\n\
-                       let (client, server_reqs) = GatewayClient::connect_local(&AttachOptions::default()).await?;\n\
-                       let list = client.list_sessions(Some(50), false).await?;\n\
-                       ```\n\n\
-                       Try typing `/` below to test the slash palette, or send a message to watch streaming Markdown render natively at 120 fps."
+                       // Auto-reconnect + gap replay in hermes-gateway\n\
+                       match client.replay_or_resume(&sid, last_seq, replay_epoch).await? {\n\
+                           ReplayOutcome::Events { events, .. } => apply_all(events),\n\
+                           ReplayOutcome::Snapshot(snap) => hydrate_snapshot(*snap),\n\
+                       }\n\
+                       ```"
                     .to_string(),
                 streaming: false,
             },
@@ -201,15 +289,77 @@ impl CompanionState {
             session_id: Some("demo-1".to_string()),
             kind: PendingPromptKind::Approval {
                 command: "cargo test --workspace".to_string(),
-                description: "Demo approval card — click Allow or Deny to test inline settlement".to_string(),
-                choices: vec![
-                    "once".to_string(),
-                    "session".to_string(),
-                    "deny".to_string(),
-                ],
+                description: "Demo approval card — click once, session, or deny".to_string(),
+                choices: vec!["once".into(), "session".into(), "deny".into()],
             },
         });
         state
+    }
+
+    /// Clear profile-scoped view state during a soft profile switch (re-home).
+    pub fn reset_for_profile_switch(&mut self, next_profile: String) {
+        self.active_profile = next_profile;
+        self.profile_menu_open = false;
+        self.sessions.clear();
+        self.active_session_id = None;
+        self.active_title = "New Chat".to_string();
+        self.last_seq = 0;
+        self.replay_epoch = None;
+        self.messages.clear();
+        self.subagents.clear();
+        self.pending_prompts.clear();
+        self.is_streaming = false;
+    }
+
+    pub fn load_profiles(&mut self, result: CanonicalProfilesResult) {
+        if result.profiles.is_empty() {
+            return;
+        }
+        self.profiles = result
+            .profiles
+            .into_iter()
+            .map(|row| ProfileInfo {
+                display_name: row
+                    .display_name
+                    .filter(|d| !d.trim().is_empty())
+                    .unwrap_or_else(|| row.name.clone()),
+                name: row.name,
+                model: row.model,
+                is_default: row.is_default.unwrap_or(false),
+            })
+            .collect();
+    }
+
+    pub fn load_subagents(&mut self, result: SubagentListResult) {
+        let Some(rows) = result.subagents else {
+            return;
+        };
+        self.subagents = rows
+            .into_iter()
+            .map(|s| {
+                let running = matches!(
+                    s.status,
+                    Some(SubagentStatus::Running | SubagentStatus::Queued)
+                );
+                let status_label = match s.status {
+                    Some(SubagentStatus::Queued) => "queued",
+                    Some(SubagentStatus::Running) => "running",
+                    Some(SubagentStatus::Completed) => "completed",
+                    Some(SubagentStatus::Error) => "error",
+                    Some(SubagentStatus::Failed) => "failed",
+                    Some(SubagentStatus::Timeout) => "timeout",
+                    Some(SubagentStatus::Interrupted) => "interrupted",
+                    None => "active",
+                }
+                .to_string();
+                SubagentSummary {
+                    id: s.subagent_id,
+                    goal: s.goal.unwrap_or_else(|| "Delegated task".into()),
+                    running,
+                    status_label,
+                }
+            })
+            .collect();
     }
 
     pub fn load_session_list(&mut self, list: CanonicalListResult) {
@@ -244,6 +394,10 @@ impl CompanionState {
 
         self.is_streaming = snap.running;
         self.last_seq = snap.last_sequence.max(0) as u64;
+        if !snap.replay_epoch.is_empty() {
+            self.replay_epoch = Some(snap.replay_epoch);
+        }
+        self.subagents.clear();
 
         let rows = snap.display_messages.unwrap_or(snap.messages);
         let mut items = Vec::with_capacity(rows.len());
@@ -286,6 +440,11 @@ impl CompanionState {
 
     /// Apply a live or replayed `GatewayEventEnvelope` to the active session view.
     pub fn apply_event(&mut self, env: GatewayEventEnvelope) {
+        if let Some(ep) = &env.replay_epoch
+            && !ep.is_empty()
+        {
+            self.replay_epoch = Some(ep.clone());
+        }
         if let Some(seq) = env.seq {
             if seq <= self.last_seq && env.replayed {
                 return;
@@ -293,16 +452,15 @@ impl CompanionState {
             self.last_seq = self.last_seq.max(seq);
         }
 
-        // Ignore session-scoped events that belong to a background session.
+        // Ignore session-scoped events that belong to a background session (except sidebar metadata).
         if let (Some(ev_sid), Some(active_sid)) = (&env.session_id, &self.active_session_id)
             && ev_sid != active_sid
         {
-            if env.event_type == "session.title" {
-                if let GatewayNotification::SessionTitle(t) = env.typed()
-                    && let Some(row) = self.sessions.iter_mut().find(|s| s.session_id == *ev_sid)
-                {
-                    row.title = t.title;
-                }
+            if env.event_type == "session.title"
+                && let GatewayNotification::SessionTitle(t) = env.typed()
+                && let Some(row) = self.sessions.iter_mut().find(|s| s.session_id == *ev_sid)
+            {
+                row.title = t.title;
             }
             return;
         }
@@ -421,6 +579,46 @@ impl CompanionState {
                     });
                 }
             }
+            GatewayNotification::SubagentStart(sub) => {
+                let id = sub
+                    .subagent_id
+                    .unwrap_or_else(|| format!("task-{}", sub.task_index));
+                let goal = if sub.goal.is_empty() {
+                    format!("Subagent #{}", sub.task_index + 1)
+                } else {
+                    sub.goal
+                };
+                if let Some(existing) = self.subagents.iter_mut().find(|s| s.id == id) {
+                    existing.goal = goal;
+                    existing.running = true;
+                    existing.status_label = "running".into();
+                } else {
+                    self.subagents.push(SubagentSummary {
+                        id,
+                        goal,
+                        running: true,
+                        status_label: "running".into(),
+                    });
+                }
+            }
+            GatewayNotification::SubagentProgress(sub) => {
+                let id = sub
+                    .subagent_id
+                    .unwrap_or_else(|| format!("task-{}", sub.task_index));
+                if let Some(existing) = self.subagents.iter_mut().find(|s| s.id == id) {
+                    existing.running = true;
+                    existing.status_label = "working".into();
+                }
+            }
+            GatewayNotification::SubagentComplete(sub) => {
+                let id = sub
+                    .subagent_id
+                    .unwrap_or_else(|| format!("task-{}", sub.task_index));
+                if let Some(existing) = self.subagents.iter_mut().find(|s| s.id == id) {
+                    existing.running = false;
+                    existing.status_label = "completed".into();
+                }
+            }
             GatewayNotification::SessionTitle(t) => {
                 self.active_title = t.title.clone();
                 if let Some(active_sid) = &self.active_session_id
@@ -452,13 +650,31 @@ impl CompanionState {
         }
     }
 
+    /// Filter sidebar sessions by title or preview text.
+    pub fn filtered_sessions(&self, query: &str) -> Vec<&SessionSummary> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return self.sessions.iter().collect();
+        }
+        self.sessions
+            .iter()
+            .filter(|s| {
+                s.title.to_lowercase().contains(&q) || s.preview.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
     /// Filter the slash command palette when the composer starts with `/`.
     pub fn matching_slash_commands(&self, input: &str) -> Vec<&SlashCommandItem> {
         let trimmed = input.trim_start();
         if !trimmed.starts_with('/') || trimmed.contains('\n') {
             return Vec::new();
         }
-        let query = trimmed[1..].split_whitespace().next().unwrap_or("").to_lowercase();
+        let query = trimmed[1..]
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
         self.slash_catalog
             .iter()
             .filter(|cmd| {
@@ -468,6 +684,97 @@ impl CompanionState {
                     || cmd.description.to_lowercase().contains(&query)
             })
             .take(8)
+            .collect()
+    }
+
+    /// Build ranked items for the `Cmd+K` Command Palette.
+    pub fn palette_items(&self, query: &str) -> Vec<PaletteItem> {
+        let q = query.trim().to_lowercase();
+        let mut items = vec![
+            PaletteItem {
+                title: "New Chat".into(),
+                subtitle: "Start a fresh Hermes session (Cmd+N)".into(),
+                badge: "Action".into(),
+                action: PaletteAction::NewChat,
+            },
+            PaletteItem {
+                title: "Open Bot Chat".into(),
+                subtitle: "Jump to this profile's canonical forever-chat".into(),
+                badge: "Bot".into(),
+                action: PaletteAction::OpenBotChat,
+            },
+            PaletteItem {
+                title: "Quick Entry Window".into(),
+                subtitle: "Open floating mini-composer (Cmd+Shift+K)".into(),
+                badge: "Window".into(),
+                action: PaletteAction::OpenQuickEntry,
+            },
+            PaletteItem {
+                title: "Toggle Dark / Light Theme".into(),
+                subtitle: "Switch between Nous Dark and Nous Light palettes".into(),
+                badge: "View".into(),
+                action: PaletteAction::ToggleTheme,
+            },
+            PaletteItem {
+                title: if self.show_reasoning {
+                    "Hide Thinking / Reasoning".into()
+                } else {
+                    "Show Thinking / Reasoning".into()
+                },
+                subtitle: "Toggle inline reasoning blocks".into(),
+                badge: "View".into(),
+                action: PaletteAction::ToggleReasoning,
+            },
+            PaletteItem {
+                title: "Toggle Sidebar".into(),
+                subtitle: "Show or hide session sidebar (Cmd+B)".into(),
+                badge: "View".into(),
+                action: PaletteAction::ToggleSidebar,
+            },
+        ];
+
+        for s in &self.sessions {
+            items.push(PaletteItem {
+                title: s.title.clone(),
+                subtitle: s.preview.clone(),
+                badge: if s.is_bot_chat { "Bot" } else { "Session" }.into(),
+                action: PaletteAction::SelectSession(s.session_id.clone()),
+            });
+        }
+
+        for p in &self.profiles {
+            if p.name != self.active_profile {
+                items.push(PaletteItem {
+                    title: format!("Switch Profile: {}", p.display_name),
+                    subtitle: p.model.clone().unwrap_or_else(|| p.name.clone()),
+                    badge: "Profile".into(),
+                    action: PaletteAction::SwitchProfile(p.name.clone()),
+                });
+            }
+        }
+
+        for cmd in &self.slash_catalog {
+            items.push(PaletteItem {
+                title: cmd.name.clone(),
+                subtitle: cmd.description.clone(),
+                badge: cmd.category.clone(),
+                action: PaletteAction::InsertSlash(cmd.name.clone()),
+            });
+        }
+
+        if q.is_empty() {
+            items.truncate(12);
+            return items;
+        }
+
+        items
+            .into_iter()
+            .filter(|item| {
+                item.title.to_lowercase().contains(&q)
+                    || item.subtitle.to_lowercase().contains(&q)
+                    || item.badge.to_lowercase().contains(&q)
+            })
+            .take(12)
             .collect()
     }
 
@@ -545,7 +852,7 @@ mod tests {
                 event_type: "message.delta".into(),
                 session_id: Some("s1".into()),
                 seq: Some(seq),
-                replay_epoch: None,
+                replay_epoch: Some("ep-1".into()),
                 authority_epoch: None,
                 execution_generation: None,
                 admission_id: None,
@@ -555,13 +862,14 @@ mod tests {
             });
         }
         assert!(state.is_streaming);
+        assert_eq!(state.replay_epoch.as_deref(), Some("ep-1"));
         assert_eq!(state.messages.len(), 1);
 
         state.apply_event(GatewayEventEnvelope {
             event_type: "message.complete".into(),
             session_id: Some("s1".into()),
             seq: Some(3),
-            replay_epoch: None,
+            replay_epoch: Some("ep-1".into()),
             authority_epoch: None,
             execution_generation: None,
             admission_id: None,
@@ -582,15 +890,53 @@ mod tests {
     }
 
     #[test]
-    fn filters_slash_commands_by_prefix_and_description() {
-        let state = CompanionState::default();
-        let all = state.matching_slash_commands("/");
-        assert!(!all.is_empty());
-
-        let comp = state.matching_slash_commands("/comp");
-        assert_eq!(comp.len(), 1);
-        assert_eq!(comp[0].name, "/compact");
-
+    fn filters_slash_commands_sessions_and_palette() {
+        let state = CompanionState::demo();
+        assert_eq!(state.matching_slash_commands("/comp").len(), 1);
         assert!(state.matching_slash_commands("hello /compact").is_empty());
+
+        let filtered = state.filtered_sessions("benchmark");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_id, "demo-2");
+
+        let palette = state.palette_items("work");
+        assert!(palette
+            .iter()
+            .any(|p| p.action == PaletteAction::SwitchProfile("work".into())));
+    }
+
+    #[test]
+    fn tracks_subagent_start_and_complete_events() {
+        let mut state = CompanionState::default();
+        state.active_session_id = Some("s1".into());
+        state.apply_event(GatewayEventEnvelope {
+            event_type: "subagent.start".into(),
+            session_id: Some("s1".into()),
+            seq: Some(1),
+            replay_epoch: None,
+            authority_epoch: None,
+            execution_generation: None,
+            admission_id: None,
+            profile: None,
+            replayed: false,
+            payload: json!({ "subagent_id": "child-1", "goal": "Audit Cargo.toml", "task_index": 0, "task_count": 1 }),
+        });
+        assert_eq!(state.subagents.len(), 1);
+        assert!(state.subagents[0].running);
+
+        state.apply_event(GatewayEventEnvelope {
+            event_type: "subagent.complete".into(),
+            session_id: Some("s1".into()),
+            seq: Some(2),
+            replay_epoch: None,
+            authority_epoch: None,
+            execution_generation: None,
+            admission_id: None,
+            profile: None,
+            replayed: false,
+            payload: json!({ "subagent_id": "child-1", "goal": "Audit Cargo.toml", "task_index": 0, "task_count": 1 }),
+        });
+        assert!(!state.subagents[0].running);
+        assert_eq!(state.subagents[0].status_label, "completed");
     }
 }
