@@ -1,0 +1,489 @@
+//! Entry point for `hermes-companion` — macOS-first native GPUI companion for Hermes Agent.
+//!
+//! Usage:
+//!   hermes-companion                     # Attach locally via `hermes gateway attach --json --start`
+//!   hermes-companion --profile work      # Attach to a named profile
+//!   hermes-companion --url ws://.../ws   # Connect directly to a gateway WebSocket URL
+//!   hermes-companion --demo              # Launch offline interactive demo (no gateway needed)
+
+mod app_view;
+mod markdown;
+mod state;
+mod theme;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use gpui::{
+    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px,
+    size,
+};
+use hermes_gateway::{
+    AttachOptions, GatewayClient, GatewayDialTarget, IncomingServerRequest,
+};
+use hermes_protocol::ServerRequestPayload;
+use serde_json::json;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
+
+use crate::app_view::{CompanionView, UiCommand, WorkerEvent};
+use crate::state::{
+    CompanionState, ConnectionStatus, PendingPrompt, PendingPromptKind, SlashCommandItem,
+};
+
+#[derive(Debug, Clone)]
+struct CliConfig {
+    demo: bool,
+    url: Option<String>,
+    profile: Option<String>,
+    hermes_home: Option<PathBuf>,
+    hermes_bin: Option<String>,
+}
+
+impl CliConfig {
+    fn from_args() -> Self {
+        let mut cfg = Self {
+            demo: false,
+            url: None,
+            profile: None,
+            hermes_home: None,
+            hermes_bin: None,
+        };
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--demo" => cfg.demo = true,
+                "--url" => cfg.url = args.next(),
+                "--profile" | "-p" => cfg.profile = args.next(),
+                "--hermes-home" => cfg.hermes_home = args.next().map(PathBuf::from),
+                "--hermes-bin" => cfg.hermes_bin = args.next(),
+                "--help" | "-h" => {
+                    println!(
+                        "hermes-companion (GPUI Milestone 0)\n\n\
+                         Options:\n\
+                           --demo                 Run offline interactive demo\n\
+                           --url <ws://...>       Connect directly to a gateway WebSocket URL\n\
+                           -p, --profile <name>   Attach to a specific Hermes profile\n\
+                           --hermes-home <path>   Override HERMES_HOME\n\
+                           --hermes-bin <path>    Path to the `hermes` executable\n"
+                    );
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+        }
+        cfg
+    }
+}
+
+fn spawn_gateway_worker(
+    cfg: CliConfig,
+    mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
+    ui_tx: mpsc::UnboundedSender<WorkerEvent>,
+) {
+    std::thread::Builder::new()
+        .name("hermes-gateway-rt".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build Tokio runtime");
+
+            rt.block_on(async move {
+                run_gateway_loop(cfg, &mut cmd_rx, &ui_tx).await;
+            });
+        })
+        .expect("failed to spawn gateway runtime thread");
+}
+
+async fn connect_once(
+    cfg: &CliConfig,
+) -> Result<(GatewayClient, mpsc::Receiver<IncomingServerRequest>), hermes_gateway::GatewayError> {
+    if let Some(url) = &cfg.url {
+        GatewayClient::connect(GatewayDialTarget::from_url(url.clone())).await
+    } else {
+        let mut opts = AttachOptions::default();
+        opts.profile = cfg.profile.clone();
+        opts.hermes_home = cfg.hermes_home.clone();
+        if let Some(bin) = &cfg.hermes_bin {
+            opts.hermes_bin = bin.clone();
+        }
+        GatewayClient::connect_local(&opts).await
+    }
+}
+
+async fn run_gateway_loop(
+    cfg: CliConfig,
+    cmd_rx: &mut mpsc::UnboundedReceiver<UiCommand>,
+    ui_tx: &mpsc::UnboundedSender<WorkerEvent>,
+) {
+    let mut client: Option<GatewayClient> = None;
+    let mut pending_server_reqs: HashMap<String, IncomingServerRequest> = HashMap::new();
+    let (internal_req_tx, mut internal_req_rx) = mpsc::unbounded_channel::<IncomingServerRequest>();
+
+    // Initial connection attempt
+    let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Connecting));
+    match connect_once(&cfg).await {
+        Ok((c, server_rx)) => {
+            hydrate_after_connect(&c, server_rx, ui_tx, &internal_req_tx).await;
+            client = Some(c);
+        }
+        Err(err) => {
+            warn!(error = %err, "initial gateway attach failed");
+            let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Disconnected(
+                err.to_string(),
+            )));
+            let _ = ui_tx.send(WorkerEvent::Notice {
+                text: format!(
+                    "Could not attach to local Hermes gateway ({err}). Click the status pill to retry, or launch with `--demo`."
+                ),
+                is_error: true,
+            });
+        }
+    }
+
+    loop {
+        tokio::select! {
+            Some(req) = internal_req_rx.recv() => {
+                let req_id = req.id.to_string();
+                let maybe_prompt = match &req.payload {
+                    ServerRequestPayload::Approval(a) => Some(PendingPrompt {
+                        id: req_id.clone(),
+                        session_id: Some(a.session_id.clone()),
+                        kind: PendingPromptKind::Approval {
+                            command: a.command.clone().unwrap_or_default(),
+                            description: a.description.clone().unwrap_or_default(),
+                            choices: a
+                                .choices
+                                .as_ref()
+                                .map(|list| {
+                                    list.iter()
+                                        .map(|c| match c {
+                                            hermes_protocol::ApprovalChoice::Once => "once",
+                                            hermes_protocol::ApprovalChoice::Session => "session",
+                                            hermes_protocol::ApprovalChoice::Always => "always",
+                                            hermes_protocol::ApprovalChoice::Deny => "deny",
+                                        })
+                                        .map(String::from)
+                                        .collect()
+                                })
+                                .unwrap_or_else(|| {
+                                    vec!["once".into(), "session".into(), "deny".into()]
+                                }),
+                        },
+                    }),
+                    ServerRequestPayload::Clarify(c) => {
+                        let first = c.questions.first();
+                        Some(PendingPrompt {
+                            id: req_id.clone(),
+                            session_id: Some(c.session_id.clone()),
+                            kind: PendingPromptKind::Clarify {
+                                question: first.map(|q| q.question.clone()).unwrap_or_else(|| "Clarification requested".into()),
+                                choices: first.and_then(|q| q.choices.clone()).unwrap_or_default(),
+                            },
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(prompt) = maybe_prompt {
+                    pending_server_reqs.insert(req_id, req);
+                    let _ = ui_tx.send(WorkerEvent::ServerPrompt(prompt));
+                }
+            }
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    UiCommand::Reconnect => {
+                        let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Connecting));
+                        match connect_once(&cfg).await {
+                            Ok((c, server_rx)) => {
+                                hydrate_after_connect(&c, server_rx, ui_tx, &internal_req_tx).await;
+                                client = Some(c);
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Disconnected(err.to_string())));
+                            }
+                        }
+                    }
+                    UiCommand::NewSession => {
+                        if let Some(c) = &client {
+                            match c.create_session(None, None).await {
+                                Ok(snap) => {
+                                    let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+                                    if let Ok(list) = c.list_sessions(Some(50), false).await {
+                                        let _ = ui_tx.send(WorkerEvent::SessionList(list));
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = ui_tx.send(WorkerEvent::Notice {
+                                        text: format!("Failed to create session: {err}"),
+                                        is_error: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    UiCommand::SelectSession(sid) => {
+                        if let Some(c) = &client {
+                            match c.resume_session(sid).await {
+                                Ok(snap) => {
+                                    let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+                                }
+                                Err(err) => {
+                                    let _ = ui_tx.send(WorkerEvent::Notice {
+                                        text: format!("Failed to resume session: {err}"),
+                                        is_error: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    UiCommand::SubmitPrompt { session_id, text } => {
+                        if let Some(c) = &client {
+                            let target_sid = match session_id {
+                                Some(sid) => Ok(sid),
+                                None => c.create_session(None, None).await.map(|snap| {
+                                    let sid = snap.session_id.clone();
+                                    let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+                                    sid
+                                }),
+                            };
+                            match target_sid {
+                                Ok(sid) => {
+                                    if let Err(err) = c.submit_prompt(sid, text).await {
+                                        let _ = ui_tx.send(WorkerEvent::Notice {
+                                            text: format!("Submit failed: {err}"),
+                                            is_error: true,
+                                        });
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = ui_tx.send(WorkerEvent::Notice {
+                                        text: format!("Could not start session: {err}"),
+                                        is_error: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    UiCommand::RunSlash { session_id, command } => {
+                        if let Some(c) = &client {
+                            let sid = session_id.unwrap_or_default();
+                            match c.slash_exec(sid, command).await {
+                                Ok(res) => {
+                                    if let Some(out) = res.output {
+                                        let _ = ui_tx.send(WorkerEvent::Notice {
+                                            text: out,
+                                            is_error: false,
+                                        });
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = ui_tx.send(WorkerEvent::Notice {
+                                        text: format!("Slash command error: {err}"),
+                                        is_error: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    UiCommand::CancelPrompt(sid) => {
+                        if let Some(c) = &client {
+                            let _ = c.cancel_prompt(sid).await;
+                        }
+                    }
+                    UiCommand::AnswerPrompt { request_id, choice } => {
+                        if let Some(req) = pending_server_reqs.remove(&request_id) {
+                            let body = match req.method.as_str() {
+                                "clarify" => json!({ "answers": { "0": choice } }),
+                                _ => json!({ "choice": choice }),
+                            };
+                            if let Err(err) = req.respond(body) {
+                                error!(error = %err, "failed to answer server request");
+                            }
+                        }
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+}
+
+async fn hydrate_after_connect(
+    client: &GatewayClient,
+    mut server_rx: mpsc::Receiver<IncomingServerRequest>,
+    ui_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    internal_req_tx: &mpsc::UnboundedSender<IncomingServerRequest>,
+) {
+    let hs = client.handshake();
+    let profile = hs
+        .runtime
+        .as_ref()
+        .map(|r| r.profile_id.clone())
+        .or_else(|| hs.target.endpoint.as_ref().map(|e| e.profile_id.clone()))
+        .unwrap_or_else(|| "default".to_string());
+    let instance_id = hs
+        .runtime
+        .as_ref()
+        .map(|r| r.instance_id.clone())
+        .unwrap_or_else(|| "local".to_string());
+    let protocol = hs
+        .negotiated_subprotocol
+        .unwrap_or_else(|| "hermes-gateway-v1".to_string());
+
+    info!(%profile, %instance_id, %protocol, "connected to Hermes gateway");
+    let _ = ui_tx.send(WorkerEvent::Status(ConnectionStatus::Connected {
+        profile,
+        instance_id,
+        protocol,
+    }));
+
+    // Forward live gateway events to GPUI.
+    let mut events_rx = client.subscribe_events();
+    let ev_ui_tx = ui_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match events_rx.recv().await {
+                Ok(env) => {
+                    if ev_ui_tx.send(WorkerEvent::GatewayEvent(env)).is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(dropped = n, "UI event stream lagged behind gateway");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Forward server->client requests into the worker loop.
+    let req_tx = internal_req_tx.clone();
+    tokio::spawn(async move {
+        while let Some(req) = server_rx.recv().await {
+            if req_tx.send(req).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Hydrate session list & slash command catalog.
+    if let Ok(list) = client.list_sessions(Some(50), false).await {
+        let first_id = list.sessions.first().map(|s| s.session_id.clone());
+        let _ = ui_tx.send(WorkerEvent::SessionList(list));
+        if let Some(sid) = first_id
+            && let Ok(snap) = client.resume_session(sid).await
+        {
+            let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+        }
+    }
+
+    if let Ok(catalog) = client.commands_catalog().await {
+        let meta = catalog.commands.unwrap_or_default();
+        let mut items = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if let Some(categories) = catalog.categories {
+            for cat in categories {
+                for pair in cat.pairs.unwrap_or_default() {
+                    if let Some(name) = pair.first() {
+                        let hidden = meta
+                            .get(name)
+                            .and_then(|m| m.desktop.as_deref())
+                            .is_some_and(|d| matches!(d, "hidden" | "terminal-only" | "messaging-only"));
+                        if !hidden && seen.insert(name.clone()) {
+                            items.push(SlashCommandItem {
+                                name: name.clone(),
+                                description: pair.get(1).cloned().unwrap_or_default(),
+                                category: cat.name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        } else if let Some(pairs) = catalog.pairs {
+            for pair in pairs {
+                if let Some(name) = pair.first()
+                    && seen.insert(name.clone())
+                {
+                    items.push(SlashCommandItem {
+                        name: name.clone(),
+                        description: pair.get(1).cloned().unwrap_or_default(),
+                        category: "Command".into(),
+                    });
+                }
+            }
+        }
+
+        // Always keep skill-derived slash commands discoverable (apps/desktop/src/AGENTS.md).
+        if let Some(skills) = catalog.skills {
+            for (skill_name, entry) in skills {
+                let slash_name = if skill_name.starts_with('/') {
+                    skill_name
+                } else {
+                    format!("/{skill_name}")
+                };
+                if seen.insert(slash_name.clone()) {
+                    items.push(SlashCommandItem {
+                        name: slash_name,
+                        description: entry.origin.unwrap_or_else(|| "Skill command".into()),
+                        category: "Skills".into(),
+                    });
+                }
+            }
+        }
+
+        if !items.is_empty() {
+            let _ = ui_tx.send(WorkerEvent::SlashCatalog(items));
+        }
+    }
+}
+
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "hermes_companion=info,hermes_gateway=info".into()),
+        )
+        .init();
+
+    let cfg = CliConfig::from_args();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+    let (ui_tx, ui_rx) = mpsc::unbounded_channel::<WorkerEvent>();
+
+    let initial_state = if cfg.demo {
+        CompanionState::demo()
+    } else {
+        spawn_gateway_worker(cfg, cmd_rx, ui_tx);
+        CompanionState::default()
+    };
+
+    Application::new().run(move |cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(1120.0), px(760.0)), cx);
+        let mut initial_state = Some(initial_state);
+        let mut ui_rx = Some(ui_rx);
+        let cmd_tx = cmd_tx.clone();
+
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Hermes".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.0), px(12.0))),
+                }),
+                ..Default::default()
+            },
+            move |_, cx| {
+                let state = initial_state.take().unwrap_or_default();
+                let rx = ui_rx
+                    .take()
+                    .unwrap_or_else(|| mpsc::unbounded_channel().1);
+                cx.new(|cx| CompanionView::new(state, cmd_tx.clone(), rx, cx))
+            },
+        )
+        .expect("failed to open Hermes companion window");
+
+        cx.activate(true);
+    });
+}
