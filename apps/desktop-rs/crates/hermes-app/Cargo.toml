@@ -8,6 +8,13 @@ license.workspace = true
 name = "hermes-companion"
 path = "src/main.rs"
 
+[features]
+# Compile Metal shaders at runtime via macOS's built-in Metal framework so
+# `cargo run` works with only Xcode Command Line Tools (no full Xcode required).
+# For release AOT metallib compilation with full Xcode, pass `--no-default-features`.
+default = ["runtime-shaders"]
+runtime-shaders = ["gpui/runtime_shaders"]
+
 [dependencies]
 anyhow = { workspace = true }
 gpui = { workspace = true }

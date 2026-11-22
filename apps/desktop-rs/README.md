@@ -38,6 +38,8 @@ python3 apps/desktop-rs/scripts/gen_protocol.py
 
 Prerequisites: Rust toolchain (`rustup`, stable 1.85+) and Xcode Command Line Tools (`xcode-select --install`).
 
+By default `hermes-app` enables `gpui/runtime_shaders` so Metal shaders compile at runtime without requiring a full Xcode installation (`xcrun metal`). For AOT `.metallib` shaders with full Xcode + Metal Toolchain installed, pass `--no-default-features`.
+
 ```bash
 cd apps/desktop-rs
 
