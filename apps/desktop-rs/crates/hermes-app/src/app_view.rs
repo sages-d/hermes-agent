@@ -11,14 +11,21 @@
 //! - Full `TextBuffer` composer (cursor, selection, word jump, clipboard, prompt history)
 //!   with `/` slash command popup + `Cmd+K` Command Palette overlay.
 
+use std::path::PathBuf;
+
 use gpui::{
     AnyElement, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontWeight, HighlightStyle,
     KeyDownEvent, SharedString, StyledText, TitlebarOptions, Window, WindowBounds, WindowKind,
     WindowOptions, div, prelude::*, px, size,
 };
+use hermes_terminal::NativeTerminal;
 use tokio::sync::mpsc;
 
 use crate::composer::TextBuffer;
+use crate::inspector::{
+    InspectorState, InspectorTab, render_files_body, render_git_body, render_terminal_body,
+};
+use crate::management::{ManagementData, ManagementTab, render_management_overlay};
 use crate::markdown::render_markdown;
 use crate::quick_entry::QuickEntryView;
 use crate::state::{
@@ -35,6 +42,7 @@ pub enum UiCommand {
     OpenBotChat,
     SelectSession(String),
     SwitchProfile(String),
+    RefreshManagement,
     SubmitPrompt {
         session_id: Option<String>,
         text: String,
@@ -64,6 +72,7 @@ pub enum WorkerEvent {
     SessionList(hermes_protocol::CanonicalListResult),
     Snapshot(hermes_protocol::CanonicalSnapshot),
     Subagents(hermes_protocol::SubagentListResult),
+    Management(ManagementData),
     GatewayEvent(hermes_protocol::GatewayEventEnvelope),
     SlashCatalog(Vec<SlashCommandItem>),
     ServerPrompt(PendingPrompt),
@@ -75,6 +84,7 @@ enum ActiveInput {
     Composer,
     SessionSearch,
     CommandPalette,
+    Terminal,
 }
 
 pub struct CompanionView {
@@ -85,6 +95,10 @@ pub struct CompanionView {
     palette_query: TextBuffer,
     palette_selected_idx: usize,
     active_input: ActiveInput,
+    inspector: InspectorState,
+    management_open: bool,
+    management_tab: ManagementTab,
+    management_data: ManagementData,
     focus_handle: FocusHandle,
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
 }
@@ -92,11 +106,17 @@ pub struct CompanionView {
 impl CompanionView {
     pub fn new(
         initial_state: CompanionState,
+        workspace_dir: PathBuf,
         cmd_tx: mpsc::UnboundedSender<UiCommand>,
         mut worker_rx: mpsc::UnboundedReceiver<WorkerEvent>,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let management_data = if matches!(initial_state.status, ConnectionStatus::Demo) {
+            ManagementData::demo()
+        } else {
+            ManagementData::default()
+        };
 
         // Zero-polling async bridge: tokio::sync::mpsc wakes GPUI directly on arrival.
         cx.spawn(async move |this, cx| {
@@ -120,6 +140,10 @@ impl CompanionView {
             palette_query: TextBuffer::default(),
             palette_selected_idx: 0,
             active_input: ActiveInput::Composer,
+            inspector: InspectorState::new(workspace_dir),
+            management_open: false,
+            management_tab: ManagementTab::Config,
+            management_data,
             focus_handle,
             cmd_tx,
         }
@@ -149,6 +173,9 @@ impl CompanionView {
             WorkerEvent::Subagents(subagents) => {
                 self.state.load_subagents(subagents);
             }
+            WorkerEvent::Management(data) => {
+                self.management_data = data;
+            }
             WorkerEvent::GatewayEvent(env) => {
                 self.state.apply_event(env);
                 self.sync_replay_cursor();
@@ -167,6 +194,83 @@ impl CompanionView {
                 self.state.messages.push(ChatItem::Notice { text, is_error });
             }
         }
+    }
+
+    fn ensure_terminal_started(&mut self, cx: &mut Context<Self>) {
+        if self.inspector.terminal.is_some() {
+            return;
+        }
+        self.restart_terminal(cx);
+    }
+
+    fn restart_terminal(&mut self, cx: &mut Context<Self>) {
+        self.inspector.terminal = None;
+        self.inspector.terminal_error = None;
+        match NativeTerminal::spawn_shell(Some(self.inspector.workspace_dir.clone()), 34, 84) {
+            Ok((term, mut rx)) => {
+                self.inspector.terminal_snap = term.snapshot();
+                self.inspector.terminal = Some(term);
+                cx.spawn(async move |this, cx| {
+                    while let Some(snap) = rx.recv().await {
+                        let res = this.update(cx, |view, cx| {
+                            view.inspector.terminal_snap = snap;
+                            cx.notify();
+                        });
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(err) => {
+                self.inspector.terminal_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn open_inspector_tab(&mut self, tab: InspectorTab, cx: &mut Context<Self>) {
+        self.inspector.open = true;
+        self.inspector.tab = tab;
+        match tab {
+            InspectorTab::Terminal => {
+                self.ensure_terminal_started(cx);
+                self.active_input = ActiveInput::Terminal;
+            }
+            InspectorTab::Git => {
+                self.inspector.refresh_git();
+                if self.active_input == ActiveInput::Terminal {
+                    self.active_input = ActiveInput::Composer;
+                }
+            }
+            InspectorTab::Files => {
+                self.inspector.refresh_files();
+                if self.active_input == ActiveInput::Terminal {
+                    self.active_input = ActiveInput::Composer;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        if self.inspector.open {
+            self.inspector.open = false;
+            if self.active_input == ActiveInput::Terminal {
+                self.active_input = ActiveInput::Composer;
+            }
+            cx.notify();
+        } else {
+            self.open_inspector_tab(self.inspector.tab, cx);
+        }
+    }
+
+    fn open_management(&mut self, cx: &mut Context<Self>) {
+        self.management_open = true;
+        if !matches!(self.state.status, ConnectionStatus::Demo) {
+            let _ = self.cmd_tx.send(UiCommand::RefreshManagement);
+        }
+        cx.notify();
     }
 
     fn sync_replay_cursor(&self) {
@@ -349,6 +453,10 @@ impl CompanionView {
                 self.open_quick_entry(cx);
                 cx.notify();
             }
+            PaletteAction::OpenTerminal => self.open_inspector_tab(InspectorTab::Terminal, cx),
+            PaletteAction::OpenGitReview => self.open_inspector_tab(InspectorTab::Git, cx),
+            PaletteAction::OpenFiles => self.open_inspector_tab(InspectorTab::Files, cx),
+            PaletteAction::OpenSettings => self.open_management(cx),
             PaletteAction::ToggleTheme => {
                 self.theme = self.theme.toggle();
                 cx.notify();
@@ -372,7 +480,7 @@ impl CompanionView {
 
     fn active_buffer_mut(&mut self) -> &mut TextBuffer {
         match self.active_input {
-            ActiveInput::Composer => &mut self.composer,
+            ActiveInput::Composer | ActiveInput::Terminal => &mut self.composer,
             ActiveInput::SessionSearch => &mut self.session_search,
             ActiveInput::CommandPalette => &mut self.palette_query,
         }
@@ -383,9 +491,26 @@ impl CompanionView {
         let mods = &event.keystroke.modifiers;
         let primary_mod = mods.platform || mods.control;
 
+        // Management overlay closes cleanly on Esc
+        if self.management_open {
+            if key == "escape" || (primary_mod && key == ",") {
+                self.management_open = false;
+                cx.notify();
+            }
+            return;
+        }
+
         // Global shortcuts (Cmd on macOS, Ctrl elsewhere)
         if primary_mod {
             match key {
+                "j" => {
+                    self.toggle_inspector(cx);
+                    return;
+                }
+                "," => {
+                    self.open_management(cx);
+                    return;
+                }
                 "k" if mods.shift => {
                     self.open_quick_entry(cx);
                     return;
@@ -421,6 +546,26 @@ impl CompanionView {
                     cx.notify();
                     return;
                 }
+                _ => {}
+            }
+        }
+
+        // When the native embedded PTY terminal is focused, forward keys directly to it
+        // (`Esc` exits terminal focus back to the chat composer; `Ctrl+C` goes to the shell).
+        if self.active_input == ActiveInput::Terminal && self.inspector.open {
+            if key == "escape" && !mods.control && !mods.platform {
+                self.active_input = ActiveInput::Composer;
+                cx.notify();
+                return;
+            }
+            let clip = cx.read_from_clipboard().and_then(|c| c.text());
+            if self.inspector.send_terminal_key(event, clip) {
+                return;
+            }
+        }
+
+        if primary_mod {
+            match key {
                 "a" => {
                     self.active_buffer_mut().select_all();
                     cx.notify();
@@ -802,6 +947,41 @@ impl CompanionView {
                             .child("Quick Entry")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.open_quick_entry(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("toggle-inspector-btn")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_xs()
+                            .when(self.inspector.open, |d| {
+                                d.bg(theme.accent_subtle).text_color(theme.accent)
+                            })
+                            .when(!self.inspector.open, |d| {
+                                d.text_color(theme.fg_muted)
+                                    .hover(|s| s.bg(theme.surface_hover).text_color(theme.fg))
+                            })
+                            .child("Workspace")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_inspector(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("open-settings-btn")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(theme.fg_muted)
+                            .hover(|s| s.bg(theme.surface_hover).text_color(theme.fg))
+                            .child("Settings")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_management(cx);
                             })),
                     )
                     .child(
@@ -1838,6 +2018,132 @@ impl CompanionView {
             )
             .into_any_element()
     }
+
+    fn render_inspector(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let tabs = [
+            (InspectorTab::Terminal, "Terminal"),
+            (InspectorTab::Git, "Git"),
+            (InspectorTab::Files, "Files"),
+        ];
+
+        let mut tab_bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .py_1p5()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar_bg);
+
+        let mut tab_group = div().flex().flex_row().items_center().gap_1();
+        for (idx, (t, label)) in tabs.into_iter().enumerate() {
+            let is_active = t == self.inspector.tab;
+            tab_group = tab_group.child(
+                div()
+                    .id(SharedString::from(format!("inspector-tab-{idx}")))
+                    .px_2p5()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_xs()
+                    .font_weight(if is_active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .when(is_active, |d| {
+                        d.bg(theme.accent_subtle).text_color(theme.accent)
+                    })
+                    .when(!is_active, |d| {
+                        d.text_color(theme.fg_muted)
+                            .hover(|s| s.bg(theme.surface_hover).text_color(theme.fg))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_inspector_tab(t, cx);
+                    })),
+            );
+        }
+
+        tab_bar = tab_bar.child(tab_group).child(
+            div()
+                .id("close-inspector-btn")
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(theme.fg_muted)
+                .hover(|s| s.bg(theme.surface_hover).text_color(theme.fg))
+                .child("✕")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_inspector(cx);
+                })),
+        );
+
+        let body = match self.inspector.tab {
+            InspectorTab::Terminal => render_terminal_body(
+                &self.inspector,
+                theme,
+                self.active_input == ActiveInput::Terminal,
+                |this: &mut Self, cx| {
+                    this.active_input = ActiveInput::Terminal;
+                    cx.notify();
+                },
+                |this: &mut Self, cx| {
+                    this.restart_terminal(cx);
+                    cx.notify();
+                },
+                cx,
+            ),
+            InspectorTab::Git => render_git_body(
+                &self.inspector,
+                theme,
+                |this: &mut Self, cx| {
+                    this.inspector.refresh_git();
+                    cx.notify();
+                },
+                |this: &mut Self, path, staged, untracked, cx| {
+                    this.inspector.select_diff(path, staged, untracked);
+                    cx.notify();
+                },
+                |this: &mut Self, path, staged, cx| {
+                    this.inspector.toggle_stage(&path, staged);
+                    cx.notify();
+                },
+                cx,
+            ),
+            InspectorTab::Files => render_files_body(
+                &self.inspector,
+                theme,
+                |this: &mut Self, cx| {
+                    this.inspector.navigate_up();
+                    cx.notify();
+                },
+                |this: &mut Self, path, cx| {
+                    this.inspector.open_path(path);
+                    cx.notify();
+                },
+                cx,
+            ),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .w(px(460.0))
+            .h_full()
+            .flex_none()
+            .bg(theme.bg)
+            .border_l_1()
+            .border_color(theme.border)
+            .child(tab_bar)
+            .child(body)
+            .into_any_element()
+    }
 }
 
 impl Focusable for CompanionView {
@@ -1881,10 +2187,34 @@ impl Render for CompanionView {
                             .h_full()
                             .child(self.render_transcript(cx))
                             .child(self.render_composer(cx)),
-                    ),
+                    )
+                    .when(self.inspector.open, |d| d.child(self.render_inspector(cx))),
             )
             .when(self.active_input == ActiveInput::CommandPalette, |d| {
                 d.child(self.render_command_palette(cx))
+            })
+            .when(self.management_open, |d| {
+                d.child(render_management_overlay(
+                    self.management_tab,
+                    &self.state,
+                    &self.management_data,
+                    theme,
+                    |this: &mut Self, cx| {
+                        this.management_open = false;
+                        cx.notify();
+                    },
+                    |this: &mut Self, tab, cx| {
+                        this.management_tab = tab;
+                        cx.notify();
+                    },
+                    |this: &mut Self, cx| {
+                        if !matches!(this.state.status, ConnectionStatus::Demo) {
+                            let _ = this.cmd_tx.send(UiCommand::RefreshManagement);
+                        }
+                        cx.notify();
+                    },
+                    cx,
+                ))
             })
     }
 }

@@ -9,6 +9,8 @@
 mod app_view;
 mod composer;
 mod highlight;
+mod inspector;
+mod management;
 mod markdown;
 mod quick_entry;
 mod state;
@@ -16,7 +18,7 @@ mod theme;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px,
@@ -32,6 +34,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::app_view::{CompanionView, UiCommand, WorkerEvent};
+use crate::management::ManagementData;
 use crate::state::{
     CompanionState, ConnectionStatus, PendingPrompt, PendingPromptKind, SlashCommandItem,
 };
@@ -43,6 +46,7 @@ struct CliConfig {
     profile: Option<String>,
     hermes_home: Option<PathBuf>,
     hermes_bin: Option<String>,
+    workspace_dir: PathBuf,
 }
 
 impl CliConfig {
@@ -53,6 +57,7 @@ impl CliConfig {
             profile: None,
             hermes_home: None,
             hermes_bin: None,
+            workspace_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -62,13 +67,19 @@ impl CliConfig {
                 "--profile" | "-p" => cfg.profile = args.next(),
                 "--hermes-home" => cfg.hermes_home = args.next().map(PathBuf::from),
                 "--hermes-bin" => cfg.hermes_bin = args.next(),
+                "--cwd" => {
+                    if let Some(p) = args.next() {
+                        cfg.workspace_dir = PathBuf::from(p);
+                    }
+                }
                 "--help" | "-h" => {
                     println!(
-                        "hermes-companion (GPUI Milestone 1)\n\n\
+                        "hermes-companion (GPUI Milestone 2)\n\n\
                          Options:\n\
                            --demo                 Run offline interactive demo\n\
                            --url <ws://...>       Connect directly to a gateway WebSocket URL\n\
                            -p, --profile <name>   Attach to a specific Hermes profile\n\
+                           --cwd <path>           Workspace directory for Terminal, Git, and Files\n\
                            --hermes-home <path>   Override HERMES_HOME\n\
                            --hermes-bin <path>    Path to the `hermes` executable\n"
                     );
@@ -286,6 +297,22 @@ async fn run_gateway_loop(
                                     is_error: true,
                                 });
                             }
+                        }
+                    }
+                    UiCommand::RefreshManagement => {
+                        if let Some(c) = &client {
+                            let timeout = Duration::from_secs(5);
+                            let config_json = c.call_raw("config.get", Some(json!({})), timeout).await.ok();
+                            let cron_json = c.call_raw("cron.status", Some(json!({})), timeout).await.ok();
+                            let usage_json = c
+                                .call_raw("session.account_usage", Some(json!({})), timeout)
+                                .await
+                                .ok();
+                            let _ = ui_tx.send(WorkerEvent::Management(ManagementData {
+                                config_json,
+                                cron_json,
+                                usage_json,
+                            }));
                         }
                     }
                     UiCommand::NewSession => {
@@ -597,6 +624,7 @@ fn main() {
         .init();
 
     let cfg = CliConfig::from_args();
+    let workspace_dir = cfg.workspace_dir.clone();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
     let (ui_tx, ui_rx) = mpsc::unbounded_channel::<WorkerEvent>();
 
@@ -608,10 +636,11 @@ fn main() {
     };
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1160.0), px(780.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1240.0), px(800.0)), cx);
         let mut initial_state = Some(initial_state);
         let mut ui_rx = Some(ui_rx);
         let cmd_tx = cmd_tx.clone();
+        let workspace_dir = workspace_dir.clone();
 
         cx.open_window(
             WindowOptions {
@@ -628,7 +657,9 @@ fn main() {
                 let rx = ui_rx
                     .take()
                     .unwrap_or_else(|| mpsc::unbounded_channel().1);
-                cx.new(|cx| CompanionView::new(state, cmd_tx.clone(), rx, cx))
+                cx.new(|cx| {
+                    CompanionView::new(state, workspace_dir.clone(), cmd_tx.clone(), rx, cx)
+                })
             },
         )
         .expect("failed to open Hermes companion window");

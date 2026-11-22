@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/hermes-protocol",
     "crates/hermes-gateway",
+    "crates/hermes-terminal",
+    "crates/hermes-git",
     "crates/hermes-app",
 ]
 
@@ -15,6 +17,7 @@ license = "MIT"
 anyhow = "1"
 futures-util = "0.3"
 gpui = "0.2.2"
+portable-pty = "0.9"
 pulldown-cmark = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,3 +29,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+vt100 = "0.18"
