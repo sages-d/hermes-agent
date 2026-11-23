@@ -25,8 +25,8 @@ use gpui::{
     size,
 };
 use hermes_gateway::{
-    AttachOptions, GatewayClient, GatewayDialTarget, IncomingServerRequest, ReconnectPolicy,
-    ReplayOutcome,
+    AttachOptions, DEFAULT_TRANSCRIPT_PAGE_LIMIT, GatewayClient, GatewayDialTarget,
+    IncomingServerRequest, ReconnectPolicy, ReplayOutcome,
 };
 use hermes_protocol::ServerRequestPayload;
 use serde_json::json;
@@ -336,8 +336,12 @@ async fn run_gateway_loop(
                     UiCommand::OpenBotChat => {
                         if let Some(c) = &client {
                             match c.open_or_create_bot_chat().await {
-                                Ok(snap) => {
-                                    let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+                                Ok(loaded) => {
+                                    let sid = loaded.snapshot.session_id.clone();
+                                    let _ = ui_tx.send(WorkerEvent::SessionLoaded(Box::new(loaded)));
+                                    if let Ok(subs) = c.list_subagents(sid).await {
+                                        let _ = ui_tx.send(WorkerEvent::Subagents(subs));
+                                    }
                                 }
                                 Err(err) => {
                                     let _ = ui_tx.send(WorkerEvent::Notice {
@@ -350,9 +354,12 @@ async fn run_gateway_loop(
                     }
                     UiCommand::SelectSession(sid) => {
                         if let Some(c) = &client {
-                            match c.resume_session(sid.clone()).await {
-                                Ok(snap) => {
-                                    let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+                            match c
+                                .resume_session_tail(sid.clone(), DEFAULT_TRANSCRIPT_PAGE_LIMIT)
+                                .await
+                            {
+                                Ok(loaded) => {
+                                    let _ = ui_tx.send(WorkerEvent::SessionLoaded(Box::new(loaded)));
                                     if let Ok(subs) = c.list_subagents(sid).await {
                                         let _ = ui_tx.send(WorkerEvent::Subagents(subs));
                                     }
@@ -360,6 +367,33 @@ async fn run_gateway_loop(
                                 Err(err) => {
                                     let _ = ui_tx.send(WorkerEvent::Notice {
                                         text: format!("Failed to resume session: {err}"),
+                                        is_error: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    UiCommand::LoadOlderMessages { session_id, cursor } => {
+                        if let Some(c) = &client {
+                            match c
+                                .transcript_page(
+                                    &session_id,
+                                    Some(cursor),
+                                    DEFAULT_TRANSCRIPT_PAGE_LIMIT,
+                                )
+                                .await
+                            {
+                                Ok(page) => {
+                                    let _ = ui_tx.send(WorkerEvent::OlderPage {
+                                        session_id,
+                                        rows: page.rows,
+                                        next_cursor: page.next_cursor,
+                                        reset: page.reset,
+                                    });
+                                }
+                                Err(err) => {
+                                    let _ = ui_tx.send(WorkerEvent::Notice {
+                                        text: format!("Failed to load earlier messages: {err}"),
                                         is_error: true,
                                     });
                                 }
@@ -535,17 +569,19 @@ async fn hydrate_after_connect(
                         let _ = ui_tx.send(WorkerEvent::GatewayEvent(ev));
                     }
                 }
-                Ok(ReplayOutcome::Snapshot(snap)) => {
-                    let _ = ui_tx.send(WorkerEvent::Snapshot(*snap));
+                Ok(ReplayOutcome::Snapshot(loaded)) => {
+                    let _ = ui_tx.send(WorkerEvent::SessionLoaded(loaded));
                 }
                 Err(err) => {
                     warn!(error = %err, "reconnect catchup failed");
                 }
             }
         } else if let Some(sid) = first_id
-            && let Ok(snap) = client.resume_session(sid.clone()).await
+            && let Ok(loaded) = client
+                .resume_session_tail(sid.clone(), DEFAULT_TRANSCRIPT_PAGE_LIMIT)
+                .await
         {
-            let _ = ui_tx.send(WorkerEvent::Snapshot(snap));
+            let _ = ui_tx.send(WorkerEvent::SessionLoaded(Box::new(loaded)));
             if let Ok(subs) = client.list_subagents(sid).await {
                 let _ = ui_tx.send(WorkerEvent::Subagents(subs));
             }

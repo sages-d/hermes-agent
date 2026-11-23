@@ -22,7 +22,8 @@ use hermes_protocol::{
     CompleteSlashResult, GatewayEventEnvelope, InboundFrame, JSON_RPC_METHOD_NOT_FOUND,
     JsonRpcErrorPayload, OutboundRequest, OutboundResponse, PromptCancelParams,
     PromptResponseResult, RawInboundFrame, RequestId, RpcMethod, RuntimeDescribeResult,
-    ServerRequestPayload, SessionParams, SlashExecParams, SlashExecResult, SubagentListResult,
+    ServerRequestPayload, SessionParams, SlashExecParams, SlashExecResult, StoredTranscriptParams,
+    StoredTranscriptResult, StoredTranscriptRow, SubagentListResult,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -30,6 +31,7 @@ use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -37,6 +39,20 @@ use crate::attach::{AttachError, AttachOptions, GatewayDialTarget, attach_local_
 
 /// Canonical Bot Mode forever-chat title (`apps/desktop/src/AGENTS.md`).
 pub const BOT_CHAT_TITLE: &str = "Bot Chat";
+
+/// Number of newest rows fetched initially when opening a session or Bot Chat.
+pub const DEFAULT_TRANSCRIPT_PAGE_LIMIT: i64 = 60;
+
+/// Result of opening/resuming a session with fast tail-only hydration.
+#[derive(Debug, Clone)]
+pub struct SessionLoadResult {
+    pub snapshot: CanonicalSnapshot,
+    /// When loaded via `session.transcript (order: "latest")`, holds the newest page in
+    /// chronological order; `None` means fall back to `snapshot.display_messages` / `messages`.
+    pub tail_rows: Option<Vec<StoredTranscriptRow>>,
+    /// Cursor to fetch the next older page via `session.transcript`, if older history exists.
+    pub older_cursor: Option<String>,
+}
 
 /// Result of attempting incremental catch-up after reconnect.
 #[derive(Debug)]
@@ -47,8 +63,8 @@ pub enum ReplayOutcome {
         replay_epoch: Option<String>,
         latest_seq: u64,
     },
-    /// Replay ring truncated or epoch rotated; full snapshot was fetched via `session.resume`.
-    Snapshot(Box<CanonicalSnapshot>),
+    /// Replay ring truncated or epoch rotated; tail-paginated session load was fetched.
+    Snapshot(Box<SessionLoadResult>),
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -212,7 +228,11 @@ impl GatewayClient {
         }
 
         debug!(target = ?target, "dialing Hermes gateway WebSocket");
-        let (ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(64 * 1024 * 1024);
+        ws_config.max_frame_size = Some(32 * 1024 * 1024);
+        let (ws_stream, response) =
+            tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false).await?;
         let negotiated_subprotocol = response
             .headers()
             .get(SEC_WEBSOCKET_PROTOCOL)
@@ -529,6 +549,68 @@ impl GatewayClient {
         .await
     }
 
+    /// Read one newest-first page of a stored conversation via `session.transcript`
+    /// without re-shipping the entire history over WebSocket.
+    pub async fn transcript_page(
+        &self,
+        session_id: impl Into<String>,
+        cursor: Option<String>,
+        limit: i64,
+    ) -> Result<StoredTranscriptResult, GatewayError> {
+        self.call::<methods::SessionTranscript>(StoredTranscriptParams {
+            session_id: session_id.into(),
+            cursor,
+            limit: Some(limit.clamp(1, 500)),
+            order: Some("latest".to_string()),
+            inline_images: Some(false),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Fast tail-only open for arbitrarily large sessions (e.g., forever `"Bot Chat"`):
+    /// 1. `session.resume { omit_messages: true }` attaches + subscribes with zero history payload.
+    /// 2. `session.transcript { order: "latest", limit }` fetches only the newest tail page + cursor.
+    /// Falls back cleanly to full `session.resume` on gateways predating `session.transcript`.
+    pub async fn resume_session_tail(
+        &self,
+        session_id: impl Into<String>,
+        limit: i64,
+    ) -> Result<SessionLoadResult, GatewayError> {
+        let sid = session_id.into();
+        let light = self
+            .call::<methods::SessionResume>(CanonicalResumeParams {
+                session_id: Some(sid.clone()),
+                omit_messages: Some(true),
+                ..Default::default()
+            })
+            .await;
+
+        if let Ok(snap) = light {
+            let target_id = if !snap.stored_session_id.is_empty() {
+                snap.stored_session_id.clone()
+            } else {
+                snap.session_id.clone()
+            };
+            if let Ok(page) = self.transcript_page(&target_id, None, limit).await
+                && (!page.rows.is_empty() || snap.message_count <= 0)
+            {
+                return Ok(SessionLoadResult {
+                    snapshot: snap,
+                    tail_rows: Some(page.rows),
+                    older_cursor: page.next_cursor,
+                });
+            }
+        }
+
+        let full = self.resume_session(sid).await?;
+        Ok(SessionLoadResult {
+            snapshot: full,
+            tail_rows: None,
+            older_cursor: None,
+        })
+    }
+
     pub async fn submit_prompt(
         &self,
         session_id: impl Into<String>,
@@ -569,7 +651,7 @@ impl GatewayClient {
     }
 
     /// Reconcile a session after reconnect: try `session.events.since` first, and fall back
-    /// to a full `session.resume` snapshot whenever the ring truncated or the epoch rotated.
+    /// to a tail-paginated `resume_session_tail` whenever the ring truncated or the epoch rotated.
     pub async fn replay_or_resume(
         &self,
         session_id: &str,
@@ -604,16 +686,17 @@ impl GatewayClient {
                 latest_seq: res.latest_seq.max(0) as u64,
             });
         }
-        let snap = self.resume_session(session_id).await?;
-        Ok(ReplayOutcome::Snapshot(Box::new(snap)))
+        let loaded = self
+            .resume_session_tail(session_id, DEFAULT_TRANSCRIPT_PAGE_LIMIT)
+            .await?;
+        Ok(ReplayOutcome::Snapshot(Box::new(loaded)))
     }
 
     /// Resolve the canonical Bot Mode forever-chat by NAME (`"Bot Chat"`), never by a stored pin.
     ///
-    /// Follows `apps/desktop/src/AGENTS.md`:
-    /// 1. `session.list { title: "Bot Chat", include_hidden: true }` -> open if found.
-    /// 2. Otherwise create titled `"Bot Chat"`, born hidden, re-checking on conflict.
-    pub async fn open_or_create_bot_chat(&self) -> Result<CanonicalSnapshot, GatewayError> {
+    /// Uses `resume_session_tail` so multi-thousand-message Bot Chats open instantaneously
+    /// with only the newest page hydrated.
+    pub async fn open_or_create_bot_chat(&self) -> Result<SessionLoadResult, GatewayError> {
         let found = self
             .call::<methods::SessionList>(CanonicalListParams {
                 title: Some(BOT_CHAT_TITLE.to_string()),
@@ -628,7 +711,9 @@ impl GatewayClient {
             .into_iter()
             .find(|s| s.title == BOT_CHAT_TITLE)
         {
-            return self.resume_session(row.session_id).await;
+            return self
+                .resume_session_tail(row.session_id, DEFAULT_TRANSCRIPT_PAGE_LIMIT)
+                .await;
         }
 
         // Adopt-before-minting: create hidden "Bot Chat"; on conflict re-query the registry.
@@ -659,7 +744,11 @@ impl GatewayClient {
             })
             .await
         {
-            Ok(snap) => Ok(snap),
+            Ok(snap) => Ok(SessionLoadResult {
+                snapshot: snap,
+                tail_rows: None,
+                older_cursor: None,
+            }),
             Err(first_err) => {
                 let retry = self
                     .call::<methods::SessionList>(CanonicalListParams {
@@ -674,7 +763,8 @@ impl GatewayClient {
                     .into_iter()
                     .find(|s| s.title == BOT_CHAT_TITLE)
                 {
-                    self.resume_session(row.session_id).await
+                    self.resume_session_tail(row.session_id, DEFAULT_TRANSCRIPT_PAGE_LIMIT)
+                        .await
                 } else {
                     Err(first_err)
                 }
@@ -1018,6 +1108,23 @@ mod tests {
                             }
                         })
                     }
+                    "session.transcript" => {
+                        let sid = params["session_id"].as_str().unwrap_or("s-1");
+                        assert_eq!(params["order"], "latest");
+                        assert_eq!(params["inline_images"], false);
+                        json!({
+                            "id": id,
+                            "result": {
+                                "session_id": sid,
+                                "rows": [
+                                    { "role": "user", "text": "older tail msg", "row_kind": "message" },
+                                    { "role": "assistant", "text": "latest reply", "row_kind": "message" }
+                                ],
+                                "next_cursor": "cur-page-2",
+                                "reset": false
+                            }
+                        })
+                    }
                     "session.resume" => {
                         let sid = params["session_id"].as_str().unwrap_or("s-1");
                         json!({
@@ -1026,7 +1133,7 @@ mod tests {
                                 "session_id": sid,
                                 "stored_session_id": sid,
                                 "messages": [],
-                                "message_count": 0,
+                                "message_count": 2500,
                                 "running": false,
                                 "authority_epoch": 2,
                                 "replay_epoch": "ep-2",
@@ -1061,17 +1168,22 @@ mod tests {
             ReplayOutcome::Snapshot(_) => panic!("expected incremental events"),
         }
 
-        // Truncated ring automatically falls back to full session.resume snapshot
+        // Truncated ring automatically falls back to tail-paginated resume
         match client.replay_or_resume("s-1", 1, Some("ep-0".into())).await.unwrap() {
-            ReplayOutcome::Snapshot(snap) => {
-                assert_eq!(snap.session_id, "s-1");
-                assert_eq!(snap.last_sequence, 50);
+            ReplayOutcome::Snapshot(loaded) => {
+                assert_eq!(loaded.snapshot.session_id, "s-1");
+                assert_eq!(loaded.snapshot.last_sequence, 50);
+                assert_eq!(loaded.older_cursor.as_deref(), Some("cur-page-2"));
+                assert_eq!(loaded.tail_rows.as_ref().map(Vec::len), Some(2));
             }
             ReplayOutcome::Events { .. } => panic!("expected snapshot fallback"),
         }
 
-        // Bot Mode resolves canonical "Bot Chat" by name with include_hidden=true
+        // Bot Mode resolves canonical "Bot Chat" by name and hydrates only the newest page
         let bot = client.open_or_create_bot_chat().await.unwrap();
-        assert_eq!(bot.session_id, "bot-forever-1");
+        assert_eq!(bot.snapshot.session_id, "bot-forever-1");
+        assert_eq!(bot.snapshot.message_count, 2500);
+        assert_eq!(bot.older_cursor.as_deref(), Some("cur-page-2"));
+        assert_eq!(bot.tail_rows.as_ref().map(Vec::len), Some(2));
     }
 }

@@ -4,10 +4,19 @@
 //! replay epoch tracking, Bot Mode labeling, subagents, session filtering,
 //! and Command Palette search are unit-testable headlessly.
 
+use std::collections::HashSet;
+
+use hermes_gateway::SessionLoadResult;
 use hermes_protocol::{
     CanonicalListResult, CanonicalProfilesResult, CanonicalSnapshot, GatewayEventEnvelope,
-    GatewayNotification, SubagentListResult, SubagentStatus, transcript_content_text,
+    GatewayNotification, StoredTranscriptRow, SubagentListResult, SubagentStatus,
+    TranscriptMessage, transcript_content_text,
 };
+
+/// Default number of newest chat items rendered into GPUI layout at once.
+pub const DEFAULT_VISIBLE_TAIL_LIMIT: usize = 60;
+/// Cap stored per-tool-call output previews so giant tool logs never bloat UI memory.
+const MAX_TOOL_OUTPUT_CHARS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -161,9 +170,15 @@ pub struct CompanionState {
     pub profile_menu_open: bool,
     pub sessions: Vec<SessionSummary>,
     pub active_session_id: Option<String>,
+    pub stored_session_id: Option<String>,
     pub active_title: String,
     pub last_seq: u64,
     pub replay_epoch: Option<String>,
+    pub total_message_count: usize,
+    pub older_cursor: Option<String>,
+    pub loading_older: bool,
+    pub visible_tail_limit: usize,
+    pub expanded_tools: HashSet<usize>,
     pub messages: Vec<ChatItem>,
     pub subagents: Vec<SubagentSummary>,
     pub is_streaming: bool,
@@ -188,9 +203,15 @@ impl Default for CompanionState {
             profile_menu_open: false,
             sessions: Vec::new(),
             active_session_id: None,
+            stored_session_id: None,
             active_title: "New Chat".to_string(),
             last_seq: 0,
             replay_epoch: None,
+            total_message_count: 0,
+            older_cursor: None,
+            loading_older: false,
+            visible_tail_limit: DEFAULT_VISIBLE_TAIL_LIMIT,
+            expanded_tools: HashSet::new(),
             messages: Vec::new(),
             subagents: Vec::new(),
             is_streaming: false,
@@ -306,9 +327,15 @@ impl CompanionState {
         self.profile_menu_open = false;
         self.sessions.clear();
         self.active_session_id = None;
+        self.stored_session_id = None;
         self.active_title = "New Chat".to_string();
         self.last_seq = 0;
         self.replay_epoch = None;
+        self.total_message_count = 0;
+        self.older_cursor = None;
+        self.loading_older = false;
+        self.visible_tail_limit = DEFAULT_VISIBLE_TAIL_LIMIT;
+        self.expanded_tools.clear();
         self.messages.clear();
         self.subagents.clear();
         self.pending_prompts.clear();
@@ -388,58 +415,94 @@ impl CompanionState {
             .collect();
     }
 
-    pub fn load_snapshot(&mut self, snap: CanonicalSnapshot) {
+    /// Hydrate from a fast tail-paginated `SessionLoadResult` (`session.resume omit_messages=true`
+    /// + `session.transcript order="latest"`), or fallback snapshot rows.
+    pub fn load_session(&mut self, loaded: SessionLoadResult) {
+        let snap = loaded.snapshot;
         self.active_session_id = Some(snap.session_id.clone());
+        self.stored_session_id = if snap.stored_session_id.is_empty() {
+            Some(snap.session_id.clone())
+        } else {
+            Some(snap.stored_session_id.clone())
+        };
         if let Some(s) = self.sessions.iter().find(|s| s.session_id == snap.session_id) {
             self.active_title = s.title.clone();
-        } else {
+        } else if self.active_title.is_empty() {
             self.active_title = "New Chat".to_string();
         }
 
         self.is_streaming = snap.running;
         self.last_seq = snap.last_sequence.max(0) as u64;
+        self.total_message_count = snap.message_count.max(0) as usize;
         if !snap.replay_epoch.is_empty() {
             self.replay_epoch = Some(snap.replay_epoch);
         }
+        self.older_cursor = loaded.older_cursor;
+        self.loading_older = false;
+        self.visible_tail_limit = DEFAULT_VISIBLE_TAIL_LIMIT;
+        self.expanded_tools.clear();
         self.subagents.clear();
 
-        let rows = snap.display_messages.unwrap_or(snap.messages);
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
-            let text = row.text.unwrap_or_else(|| {
-                row.content
-                    .as_ref()
-                    .map(transcript_content_text)
-                    .unwrap_or_default()
-            });
-            match row.role.as_str() {
-                "user" => {
-                    if !text.trim().is_empty() {
-                        items.push(ChatItem::User { text });
-                    }
-                }
-                "assistant" => {
-                    if !text.trim().is_empty() {
-                        items.push(ChatItem::Assistant {
-                            text,
-                            reasoning: String::new(),
-                            streaming: false,
-                        });
-                    }
-                }
-                "tool" => {
-                    let name = row.name.unwrap_or_else(|| "tool".to_string());
-                    items.push(ChatItem::ToolCall {
-                        name,
-                        summary: text.lines().next().unwrap_or("").chars().take(90).collect(),
-                        status: ToolStatus::Completed,
-                        output: if text.is_empty() { None } else { Some(text) },
-                    });
-                }
-                _ => {}
-            }
+        self.messages = match loaded.tail_rows {
+            Some(rows) => chat_items_from_stored_rows(rows),
+            None => chat_items_from_transcript_messages(snap.display_messages.unwrap_or(snap.messages)),
+        };
+    }
+
+    pub fn load_snapshot(&mut self, snap: CanonicalSnapshot) {
+        self.load_session(SessionLoadResult {
+            snapshot: snap,
+            tail_rows: None,
+            older_cursor: None,
+        });
+    }
+
+    /// Prepend an older page fetched via `session.transcript` before the currently loaded tail.
+    /// If `reset` is true (e.g. a compaction rotated the segment), replace the loaded tail cleanly.
+    pub fn prepend_older_page(
+        &mut self,
+        rows: Vec<StoredTranscriptRow>,
+        next_cursor: Option<String>,
+        reset: bool,
+    ) {
+        self.loading_older = false;
+        self.older_cursor = next_cursor;
+        let older = chat_items_from_stored_rows(rows);
+        if reset {
+            self.messages = older;
+            self.expanded_tools.clear();
+            self.visible_tail_limit = DEFAULT_VISIBLE_TAIL_LIMIT;
+            return;
         }
-        self.messages = items;
+        if older.is_empty() {
+            return;
+        }
+        let added = older.len();
+        let existing = std::mem::take(&mut self.messages);
+        let mut combined = Vec::with_capacity(added + existing.len());
+        combined.extend(older);
+        combined.extend(existing);
+        self.messages = combined;
+        // Shift expanded tool indices so previously expanded cards stay expanded.
+        self.expanded_tools = self.expanded_tools.iter().map(|i| i + added).collect();
+        self.visible_tail_limit = self.visible_tail_limit.saturating_add(added);
+    }
+
+    /// Return `(start_index, slice)` of the bounded tail window rendered into GPUI layout.
+    pub fn visible_message_window(&self) -> (usize, &[ChatItem]) {
+        let len = self.messages.len();
+        let start = len.saturating_sub(self.visible_tail_limit.max(1));
+        (start, &self.messages[start..])
+    }
+
+    pub fn reveal_more_loaded(&mut self, count: usize) {
+        self.visible_tail_limit = self.visible_tail_limit.saturating_add(count);
+    }
+
+    pub fn toggle_tool_expanded(&mut self, msg_idx: usize) {
+        if !self.expanded_tools.remove(&msg_idx) {
+            self.expanded_tools.insert(msg_idx);
+        }
     }
 
     /// Apply a live or replayed `GatewayEventEnvelope` to the active session view.
@@ -865,6 +928,109 @@ fn default_slash_catalog() -> Vec<SlashCommandItem> {
     ]
 }
 
+fn truncate_tool_output(raw: String) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.chars().count() <= MAX_TOOL_OUTPUT_CHARS {
+        return Some(raw);
+    }
+    let clipped: String = raw.chars().take(MAX_TOOL_OUTPUT_CHARS).collect();
+    Some(format!("{clipped}\n… (truncated)"))
+}
+
+fn chat_items_from_stored_rows(rows: Vec<StoredTranscriptRow>) -> Vec<ChatItem> {
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let text = row.text.unwrap_or_else(|| {
+            row.content
+                .as_ref()
+                .map(transcript_content_text)
+                .unwrap_or_default()
+        });
+        if row.row_kind == "compaction" {
+            let label = if text.trim().is_empty() {
+                "Earlier messages compacted".to_string()
+            } else {
+                format!("Compacted history: {}", text.lines().next().unwrap_or(""))
+            };
+            items.push(ChatItem::Notice {
+                text: label,
+                is_error: false,
+            });
+            continue;
+        }
+        match row.role.as_str() {
+            "user" => {
+                if !text.trim().is_empty() {
+                    items.push(ChatItem::User { text });
+                }
+            }
+            "assistant" => {
+                if !text.trim().is_empty() {
+                    items.push(ChatItem::Assistant {
+                        text,
+                        reasoning: row.reasoning.unwrap_or_default(),
+                        streaming: false,
+                    });
+                }
+            }
+            "tool" => {
+                let name = row.name.unwrap_or_else(|| "tool".to_string());
+                let summary: String = text.lines().next().unwrap_or("").chars().take(120).collect();
+                items.push(ChatItem::ToolCall {
+                    name,
+                    summary,
+                    status: ToolStatus::Completed,
+                    output: truncate_tool_output(text),
+                });
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+fn chat_items_from_transcript_messages(rows: Vec<TranscriptMessage>) -> Vec<ChatItem> {
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let text = row.text.unwrap_or_else(|| {
+            row.content
+                .as_ref()
+                .map(transcript_content_text)
+                .unwrap_or_default()
+        });
+        match row.role.as_str() {
+            "user" => {
+                if !text.trim().is_empty() {
+                    items.push(ChatItem::User { text });
+                }
+            }
+            "assistant" => {
+                if !text.trim().is_empty() {
+                    items.push(ChatItem::Assistant {
+                        text,
+                        reasoning: String::new(),
+                        streaming: false,
+                    });
+                }
+            }
+            "tool" => {
+                let name = row.name.unwrap_or_else(|| "tool".to_string());
+                let summary: String = text.lines().next().unwrap_or("").chars().take(120).collect();
+                items.push(ChatItem::ToolCall {
+                    name,
+                    summary,
+                    status: ToolStatus::Completed,
+                    output: truncate_tool_output(text),
+                });
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,5 +1132,49 @@ mod tests {
         });
         assert!(!state.subagents[0].running);
         assert_eq!(state.subagents[0].status_label, "completed");
+    }
+
+    #[test]
+    fn tail_windowing_and_older_page_prepend_preserve_order_and_tool_indices() {
+        let mut state = CompanionState::default();
+        for i in 0..150 {
+            state.messages.push(ChatItem::User {
+                text: format!("msg {i}"),
+            });
+        }
+        state.visible_tail_limit = 50;
+        let (start, slice) = state.visible_message_window();
+        assert_eq!(start, 100);
+        assert_eq!(slice.len(), 50);
+
+        state.toggle_tool_expanded(120);
+        state.prepend_older_page(
+            vec![StoredTranscriptRow {
+                role: "user".into(),
+                text: Some("older-0".into()),
+                row_kind: "message".into(),
+                ..Default::default()
+            }],
+            Some("cursor-next".into()),
+            false,
+        );
+        assert_eq!(state.messages.len(), 151);
+        assert_eq!(state.older_cursor.as_deref(), Some("cursor-next"));
+        assert!(state.expanded_tools.contains(&121));
+
+        // If a compaction rotated the segment, `reset = true` replaces cleanly without duplicates.
+        state.prepend_older_page(
+            vec![StoredTranscriptRow {
+                role: "assistant".into(),
+                text: Some("fresh-tail".into()),
+                row_kind: "message".into(),
+                ..Default::default()
+            }],
+            None,
+            true,
+        );
+        assert_eq!(state.messages.len(), 1);
+        assert!(state.expanded_tools.is_empty());
+        assert!(state.older_cursor.is_none());
     }
 }

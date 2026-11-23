@@ -1,9 +1,20 @@
-//! Fast native streaming Markdown renderer for GPUI powered by `pulldown-cmark`.
+//! Fast, memoized native streaming Markdown renderer for GPUI (`pulldown-cmark` + `syntect`).
 //!
-//! Renders headings, inline bold/italic/code via GPUI `StyledText` + `HighlightStyle`,
-//! bullet/numbered lists, blockquotes, and fenced code blocks with language badges.
+//! Performance invariants for multi-thousand-message sessions (e.g. Bot Chat):
+//! - Parsed Markdown blocks AND `syntect` highlight spans are cached by
+//!   `(content_hash, content_len, theme_mode, highlight_code)` in a bounded cache (512 entries).
+//!   Typing, hovering, or streaming deltas at the tail perform ZERO re-parsing or re-highlighting
+//!   of historical messages.
+//! - Actively streaming messages (`streaming = true`) skip `syntect` until complete so tokens
+//!   render in sub-millisecond time.
+//! - Huge code blocks (> 16 KiB) degrade cleanly to plain monospace so a single giant log dump
+//!   never stalls a frame.
 
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use gpui::{
     AnyElement, ClipboardItem, FontStyle, FontWeight, HighlightStyle, IntoElement, SharedString,
@@ -11,8 +22,11 @@ use gpui::{
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
-use crate::highlight::highlighted_code;
-use crate::theme::HermesTheme;
+use crate::highlight::highlight_spans;
+use crate::theme::{HermesTheme, ThemeMode};
+
+const MAX_CACHE_ENTRIES: usize = 512;
+const MAX_HIGHLIGHT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone)]
 enum InlineSpanKind {
@@ -62,10 +76,13 @@ impl RichParagraph {
         }
     }
 
-    fn render(self, theme: &HermesTheme) -> StyledText {
+    fn render(&self, theme: &HermesTheme) -> StyledText {
+        if self.spans.is_empty() {
+            return StyledText::new(self.text.clone());
+        }
         let highlights = self
             .spans
-            .into_iter()
+            .iter()
             .map(|(range, kind)| {
                 let style = match kind {
                     InlineSpanKind::Bold => HighlightStyle {
@@ -82,29 +99,84 @@ impl RichParagraph {
                         ..Default::default()
                     },
                 };
-                (range, style)
+                (range.clone(), style)
             })
             .collect::<Vec<_>>();
 
-        if highlights.is_empty() {
-            StyledText::new(self.text)
-        } else {
-            StyledText::new(self.text).with_highlights(highlights)
-        }
+        StyledText::new(self.text.clone()).with_highlights(highlights)
     }
 }
 
 #[derive(Debug, Clone)]
-enum Block {
-    Heading { level: u8, content: RichParagraph },
+enum CachedBlock {
+    Heading {
+        level: u8,
+        content: RichParagraph,
+    },
     Paragraph(RichParagraph),
-    ListItem { bullet: String, content: RichParagraph },
+    ListItem {
+        bullet: String,
+        content: RichParagraph,
+    },
     Blockquote(RichParagraph),
-    CodeBlock { lang: String, code: String },
+    CodeBlock {
+        lang: String,
+        code: String,
+        /// Pre-computed `syntect` spans for `(theme_mode, highlight_code)`.
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
+    },
 }
 
-/// Parse Markdown into renderable blocks (kept separate from GPUI for fast unit testing).
-fn parse_blocks(markdown: &str) -> Vec<Block> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CacheKey {
+    hash: u64,
+    len: usize,
+    mode: ThemeMode,
+    highlight_code: bool,
+}
+
+fn cache() -> &'static Mutex<HashMap<CacheKey, Arc<Vec<CachedBlock>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<CacheKey, Arc<Vec<CachedBlock>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::with_capacity(128)))
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cached_blocks(markdown: &str, mode: ThemeMode, highlight_code: bool) -> Arc<Vec<CachedBlock>> {
+    // Do not churn the cache for actively streaming (mutating every delta) messages.
+    if !highlight_code {
+        return Arc::new(parse_blocks(markdown, mode, false));
+    }
+
+    let key = CacheKey {
+        hash: hash_str(markdown),
+        len: markdown.len(),
+        mode,
+        highlight_code,
+    };
+
+    if let Ok(guard) = cache().lock()
+        && let Some(hit) = guard.get(&key)
+    {
+        return Arc::clone(hit);
+    }
+
+    let parsed = Arc::new(parse_blocks(markdown, mode, true));
+    if let Ok(mut guard) = cache().lock() {
+        if guard.len() >= MAX_CACHE_ENTRIES {
+            guard.clear();
+        }
+        guard.insert(key, Arc::clone(&parsed));
+    }
+    parsed
+}
+
+/// Parse Markdown into cached renderable blocks (including pre-computed syntax highlight spans).
+fn parse_blocks(markdown: &str, mode: ThemeMode, highlight_code: bool) -> Vec<CachedBlock> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
@@ -124,7 +196,7 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
     let mut in_list_item = false;
 
     let flush_current = |cur: &mut RichParagraph,
-                         blocks: &mut Vec<Block>,
+                         blocks: &mut Vec<CachedBlock>,
                          heading: Option<u8>,
                          blockquote: bool,
                          list_item: Option<String>| {
@@ -134,19 +206,19 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
         }
         let taken = std::mem::replace(cur, RichParagraph::new());
         if let Some(level) = heading {
-            blocks.push(Block::Heading {
+            blocks.push(CachedBlock::Heading {
                 level,
                 content: taken,
             });
         } else if let Some(bullet) = list_item {
-            blocks.push(Block::ListItem {
+            blocks.push(CachedBlock::ListItem {
                 bullet,
                 content: taken,
             });
         } else if blockquote {
-            blocks.push(Block::Blockquote(taken));
+            blocks.push(CachedBlock::Blockquote(taken));
         } else {
-            blocks.push(Block::Paragraph(taken));
+            blocks.push(CachedBlock::Paragraph(taken));
         }
     };
 
@@ -210,9 +282,16 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
                 let code = code_buf.trim_end_matches('\n').to_string();
-                blocks.push(Block::CodeBlock {
-                    lang: std::mem::take(&mut code_lang),
+                let lang = std::mem::take(&mut code_lang);
+                let highlights = if highlight_code && code.len() <= MAX_HIGHLIGHT_BYTES {
+                    highlight_spans(&code, &lang, mode)
+                } else {
+                    Vec::new()
+                };
+                blocks.push(CachedBlock::CodeBlock {
+                    lang,
                     code,
+                    highlights,
                 });
                 code_buf.clear();
             }
@@ -250,9 +329,16 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
 
     // Handle mid-stream unclosed code fences or trailing paragraphs gracefully.
     if in_code_block && !code_buf.is_empty() {
-        blocks.push(Block::CodeBlock {
+        let code = code_buf.trim_end_matches('\n').to_string();
+        let highlights = if highlight_code && code.len() <= MAX_HIGHLIGHT_BYTES {
+            highlight_spans(&code, &code_lang, mode)
+        } else {
+            Vec::new()
+        };
+        blocks.push(CachedBlock::CodeBlock {
             lang: code_lang,
-            code: code_buf.trim_end_matches('\n').to_string(),
+            code,
+            highlights,
         });
     } else {
         flush_current(&mut current, &mut blocks, heading_level, in_blockquote, None);
@@ -261,9 +347,16 @@ fn parse_blocks(markdown: &str) -> Vec<Block> {
     blocks
 }
 
-/// Render Markdown text into a vertical stack of GPUI elements.
-pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
-    let blocks = parse_blocks(markdown);
+/// Render Markdown text into a vertical stack of GPUI elements using the memoized block cache.
+/// Pass `streaming = true` for the active in-flight turn to skip expensive regex highlighting
+/// until the turn settles.
+pub fn render_markdown(
+    msg_idx: usize,
+    markdown: &str,
+    theme: &HermesTheme,
+    streaming: bool,
+) -> AnyElement {
+    let blocks = cached_blocks(markdown, theme.mode, !streaming);
     if blocks.is_empty() {
         return div()
             .text_sm()
@@ -273,9 +366,9 @@ pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
     }
 
     let mut container = div().flex().flex_col().gap_2().w_full();
-    for (block_idx, block) in blocks.into_iter().enumerate() {
+    for (block_idx, block) in blocks.iter().enumerate() {
         let elem: AnyElement = match block {
-            Block::Heading { level, content } => {
+            CachedBlock::Heading { level, content } => {
                 let mut d = div()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.fg)
@@ -287,13 +380,13 @@ pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
                 };
                 d.child(content.render(theme)).into_any_element()
             }
-            Block::Paragraph(content) => div()
+            CachedBlock::Paragraph(content) => div()
                 .text_sm()
                 .line_height(px(21.0))
                 .text_color(theme.fg)
                 .child(content.render(theme))
                 .into_any_element(),
-            Block::ListItem { bullet, content } => div()
+            CachedBlock::ListItem { bullet, content } => div()
                 .flex()
                 .flex_row()
                 .gap_2()
@@ -305,11 +398,11 @@ pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
                     div()
                         .flex_none()
                         .text_color(theme.fg_muted)
-                        .child(bullet),
+                        .child(bullet.clone()),
                 )
                 .child(div().flex_1().child(content.render(theme)))
                 .into_any_element(),
-            Block::Blockquote(content) => div()
+            CachedBlock::Blockquote(content) => div()
                 .border_l_2()
                 .border_color(theme.accent)
                 .pl_3()
@@ -318,15 +411,23 @@ pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
                 .text_color(theme.fg_muted)
                 .child(content.render(theme))
                 .into_any_element(),
-            Block::CodeBlock { lang, code } => {
+            CachedBlock::CodeBlock {
+                lang,
+                code,
+                highlights,
+            } => {
                 let label = if lang.is_empty() {
                     "code".to_string()
                 } else {
                     lang.clone()
                 };
                 let copy_text = code.clone();
-                let highlighted = highlighted_code(&code, &lang, theme.mode);
-                let copy_id = SharedString::from(format!("copy-code-{block_idx}-{}", code.len()));
+                let styled_code = if highlights.is_empty() {
+                    StyledText::new(code.clone())
+                } else {
+                    StyledText::new(code.clone()).with_highlights(highlights.clone())
+                };
+                let copy_id = SharedString::from(format!("copy-code-{msg_idx}-{block_idx}"));
                 let hover_bg = theme.surface_hover;
                 let fg_color = theme.fg;
                 div()
@@ -374,7 +475,7 @@ pub fn render_markdown(markdown: &str, theme: &HermesTheme) -> AnyElement {
                             .line_height(px(18.0))
                             .font_family("Menlo")
                             .text_color(theme.fg)
-                            .child(highlighted),
+                            .child(styled_code),
                     )
                     .into_any_element()
             }
@@ -392,19 +493,35 @@ mod tests {
     #[test]
     fn parses_headings_lists_and_fenced_code() {
         let md = "### Title\n\nHello **world** with `code`.\n\n- item one\n- item two\n\n```rust\nfn main() {}\n```";
-        let blocks = parse_blocks(md);
-        assert!(matches!(blocks[0], Block::Heading { level: 3, .. }));
-        assert!(matches!(blocks[1], Block::Paragraph(_)));
-        assert!(matches!(blocks[2], Block::ListItem { .. }));
-        assert!(matches!(blocks[3], Block::ListItem { .. }));
-        assert!(matches!(blocks[4], Block::CodeBlock { ref lang, .. } if lang == "rust"));
+        let blocks = parse_blocks(md, ThemeMode::Dark, true);
+        assert!(matches!(blocks[0], CachedBlock::Heading { level: 3, .. }));
+        assert!(matches!(blocks[1], CachedBlock::Paragraph(_)));
+        assert!(matches!(blocks[2], CachedBlock::ListItem { .. }));
+        assert!(matches!(blocks[3], CachedBlock::ListItem { .. }));
+        assert!(matches!(
+            blocks[4],
+            CachedBlock::CodeBlock { ref lang, ref highlights, .. }
+            if lang == "rust" && !highlights.is_empty()
+        ));
     }
 
     #[test]
-    fn handles_unclosed_streaming_fence() {
+    fn handles_unclosed_streaming_fence_without_blocking_highlight() {
         let md = "Streaming:\n\n```python\nprint(1 + 2)";
-        let blocks = parse_blocks(md);
+        let blocks = parse_blocks(md, ThemeMode::Dark, false);
         assert_eq!(blocks.len(), 2);
-        assert!(matches!(blocks[1], Block::CodeBlock { ref lang, .. } if lang == "python"));
+        assert!(matches!(
+            blocks[1],
+            CachedBlock::CodeBlock { ref lang, ref highlights, .. }
+            if lang == "python" && highlights.is_empty()
+        ));
+    }
+
+    #[test]
+    fn memoizes_parsed_markdown_across_repeated_renders() {
+        let md = "Cached **markdown** with ```rust\nlet x = 1;\n```";
+        let first = cached_blocks(md, ThemeMode::Dark, true);
+        let second = cached_blocks(md, ThemeMode::Dark, true);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

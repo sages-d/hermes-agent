@@ -15,9 +15,10 @@ use std::path::PathBuf;
 
 use gpui::{
     AnyElement, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    KeyDownEvent, SharedString, StyledText, TitlebarOptions, Window, WindowBounds, WindowKind,
-    WindowOptions, div, prelude::*, px, size,
+    KeyDownEvent, ScrollHandle, SharedString, StyledText, TitlebarOptions, Window, WindowBounds,
+    WindowKind, WindowOptions, div, prelude::*, px, size,
 };
+use hermes_gateway::SessionLoadResult;
 use hermes_terminal::NativeTerminal;
 use tokio::sync::mpsc;
 
@@ -29,8 +30,8 @@ use crate::management::{ManagementData, ManagementTab, render_management_overlay
 use crate::markdown::render_markdown;
 use crate::quick_entry::QuickEntryView;
 use crate::state::{
-    ChatItem, CompanionState, ConnectionStatus, PaletteAction, PendingPrompt, PendingPromptKind,
-    SessionSummary, SlashCommandItem, ToolStatus,
+    ChatItem, CompanionState, ConnectionStatus, DEFAULT_VISIBLE_TAIL_LIMIT, PaletteAction,
+    PendingPrompt, PendingPromptKind, SessionSummary, SlashCommandItem, ToolStatus,
 };
 use crate::theme::{HermesTheme, ThemeMode};
 
@@ -41,6 +42,10 @@ pub enum UiCommand {
     NewSession,
     OpenBotChat,
     SelectSession(String),
+    LoadOlderMessages {
+        session_id: String,
+        cursor: String,
+    },
     SwitchProfile(String),
     RefreshManagement,
     SubmitPrompt {
@@ -70,7 +75,14 @@ pub enum WorkerEvent {
     Skin(hermes_protocol::SkinPayload),
     Profiles(hermes_protocol::CanonicalProfilesResult),
     SessionList(hermes_protocol::CanonicalListResult),
+    SessionLoaded(Box<SessionLoadResult>),
     Snapshot(hermes_protocol::CanonicalSnapshot),
+    OlderPage {
+        session_id: String,
+        rows: Vec<hermes_protocol::StoredTranscriptRow>,
+        next_cursor: Option<String>,
+        reset: bool,
+    },
     Subagents(hermes_protocol::SubagentListResult),
     Management(ManagementData),
     GatewayEvent(hermes_protocol::GatewayEventEnvelope),
@@ -99,6 +111,7 @@ pub struct CompanionView {
     management_open: bool,
     management_tab: ManagementTab,
     management_data: ManagementData,
+    transcript_scroll: ScrollHandle,
     focus_handle: FocusHandle,
     cmd_tx: mpsc::UnboundedSender<UiCommand>,
 }
@@ -118,11 +131,21 @@ impl CompanionView {
             ManagementData::default()
         };
 
-        // Zero-polling async bridge: tokio::sync::mpsc wakes GPUI directly on arrival.
+        // Zero-polling async bridge: tokio::sync::mpsc wakes GPUI directly on arrival and
+        // coalesces bursts (fast token deltas / reconnect replay) into one frame update.
         cx.spawn(async move |this, cx| {
             while let Some(ev) = worker_rx.recv().await {
+                let mut batch = vec![ev];
+                while let Ok(more) = worker_rx.try_recv() {
+                    batch.push(more);
+                    if batch.len() >= 256 {
+                        break;
+                    }
+                }
                 let updated = this.update(cx, |view, cx| {
-                    view.handle_worker_event(ev);
+                    for event in batch {
+                        view.handle_worker_event(event);
+                    }
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -144,6 +167,7 @@ impl CompanionView {
             management_open: false,
             management_tab: ManagementTab::Config,
             management_data,
+            transcript_scroll: ScrollHandle::new(),
             focus_handle,
             cmd_tx,
         }
@@ -166,9 +190,28 @@ impl CompanionView {
             WorkerEvent::SessionList(list) => {
                 self.state.load_session_list(list);
             }
+            WorkerEvent::SessionLoaded(loaded) => {
+                self.state.load_session(*loaded);
+                self.transcript_scroll.scroll_to_bottom();
+                self.sync_replay_cursor();
+            }
             WorkerEvent::Snapshot(snap) => {
                 self.state.load_snapshot(snap);
+                self.transcript_scroll.scroll_to_bottom();
                 self.sync_replay_cursor();
+            }
+            WorkerEvent::OlderPage {
+                session_id,
+                rows,
+                next_cursor,
+                reset,
+            } => {
+                let matches_active = self.state.stored_session_id.as_deref()
+                    == Some(session_id.as_str())
+                    || self.state.active_session_id.as_deref() == Some(session_id.as_str());
+                if matches_active {
+                    self.state.prepend_older_page(rows, next_cursor, reset);
+                }
             }
             WorkerEvent::Subagents(subagents) => {
                 self.state.load_subagents(subagents);
@@ -191,6 +234,7 @@ impl CompanionView {
                 }
             }
             WorkerEvent::Notice { text, is_error } => {
+                self.state.loading_older = false;
                 self.state.messages.push(ChatItem::Notice { text, is_error });
             }
         }
@@ -357,6 +401,7 @@ impl CompanionView {
                 text,
             });
         }
+        self.transcript_scroll.scroll_to_bottom();
         cx.notify();
     }
 
@@ -1330,6 +1375,7 @@ impl CompanionView {
         let theme = &self.theme;
         let mut feed = div()
             .id("transcript-scroll")
+            .track_scroll(&self.transcript_scroll)
             .flex()
             .flex_col()
             .flex_1()
@@ -1370,8 +1416,97 @@ impl CompanionView {
                     ),
             );
         } else {
-            for item in &self.state.messages {
-                column = column.child(self.render_chat_item(item));
+            let (start_idx, visible) = self.state.visible_message_window();
+
+            // Top pagination banner: either reveal more already-loaded rows or fetch the next
+            // older page from `session.transcript (order: "latest")` on demand.
+            if start_idx > 0 {
+                column = column.child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .w_full()
+                        .child(
+                            div()
+                                .id("reveal-more-loaded-btn")
+                                .px_3()
+                                .py_1p5()
+                                .rounded_full()
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme.fg_muted)
+                                .hover(|s| s.bg(theme.surface_hover).text_color(theme.fg))
+                                .child(format!(
+                                    "↑ Show earlier messages ({start_idx} hidden in memory)"
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.reveal_more_loaded(DEFAULT_VISIBLE_TAIL_LIMIT);
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            } else if let Some(cursor) = self.state.older_cursor.clone() {
+                let target_sid = self
+                    .state
+                    .stored_session_id
+                    .clone()
+                    .or_else(|| self.state.active_session_id.clone());
+                let total_hint = if self.state.total_message_count > self.state.messages.len() {
+                    format!(
+                        " (showing latest {} of ~{})",
+                        self.state.messages.len(),
+                        self.state.total_message_count
+                    )
+                } else {
+                    String::new()
+                };
+                let label = if self.state.loading_older {
+                    "Loading earlier messages…".to_string()
+                } else {
+                    format!("↑ Load earlier history{total_hint}")
+                };
+                column = column.child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .w_full()
+                        .child(
+                            div()
+                                .id("load-older-history-btn")
+                                .px_3()
+                                .py_1p5()
+                                .rounded_full()
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(theme.accent)
+                                .hover(|s| s.bg(theme.surface_hover))
+                                .child(label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.state.loading_older {
+                                        return;
+                                    }
+                                    if let Some(sid) = target_sid.clone() {
+                                        this.state.loading_older = true;
+                                        let _ = this.cmd_tx.send(UiCommand::LoadOlderMessages {
+                                            session_id: sid,
+                                            cursor: cursor.clone(),
+                                        });
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                );
+            }
+
+            for (offset, item) in visible.iter().enumerate() {
+                let msg_idx = start_idx + offset;
+                column = column.child(self.render_chat_item(msg_idx, item, cx));
             }
         }
 
@@ -1387,7 +1522,12 @@ impl CompanionView {
         feed.into_any_element()
     }
 
-    fn render_chat_item(&self, item: &ChatItem) -> AnyElement {
+    fn render_chat_item(
+        &self,
+        msg_idx: usize,
+        item: &ChatItem,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = &self.theme;
         match item {
             ChatItem::User { text } => div()
@@ -1431,7 +1571,7 @@ impl CompanionView {
                             .child(format!("Thinking: {reasoning}")),
                     )
                 })
-                .child(render_markdown(text, theme))
+                .child(render_markdown(msg_idx, text, theme, *streaming))
                 .when(*streaming, |d| {
                     d.child(
                         div()
@@ -1452,16 +1592,27 @@ impl CompanionView {
                     ToolStatus::Completed => (theme.success, "done"),
                     ToolStatus::Failed => (theme.destructive, "failed"),
                 };
+                let expanded = self.state.expanded_tools.contains(&msg_idx);
+                let has_output = output.is_some();
                 div()
+                    .id(SharedString::from(format!("tool-card-{msg_idx}")))
                     .flex()
                     .flex_col()
                     .gap_1()
                     .px_3()
-                    .py_2()
+                    .py_1p5()
                     .rounded_md()
                     .bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
+                    .when(has_output, |d| {
+                        d.cursor_pointer()
+                            .hover(|s| s.bg(theme.surface_hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.state.toggle_tool_expanded(msg_idx);
+                                cx.notify();
+                            }))
+                    })
                     .child(
                         div()
                             .flex()
@@ -1475,6 +1626,7 @@ impl CompanionView {
                                     .flex_row()
                                     .items_center()
                                     .gap_2()
+                                    .min_w_0()
                                     .child(div().size(px(7.0)).rounded_full().bg(dot_color))
                                     .child(
                                         div()
@@ -1494,15 +1646,35 @@ impl CompanionView {
                                         )
                                     }),
                             )
-                            .child(div().text_xs().text_color(theme.fg_muted).child(badge)),
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .text_xs()
+                                    .text_color(theme.fg_muted)
+                                    .child(badge)
+                                    .when(has_output, |d| {
+                                        d.child(if expanded { "▾" } else { "▸" })
+                                    }),
+                            ),
                     )
-                    .when_some(output.as_ref(), |d, out| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.fg_muted)
-                                .child(out.clone()),
-                        )
+                    .when(expanded, |d| {
+                        d.when_some(output.as_ref(), |inner, out| {
+                            inner.child(
+                                div()
+                                    .mt_1()
+                                    .p_2()
+                                    .rounded_sm()
+                                    .bg(theme.code_bg)
+                                    .font_family("Menlo")
+                                    .text_xs()
+                                    .line_height(px(16.0))
+                                    .text_color(theme.fg_muted)
+                                    .child(out.clone()),
+                            )
+                        })
                     })
                     .into_any_element()
             }
